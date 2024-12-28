@@ -13,11 +13,11 @@ name: "CodeQL"
 
 on:
   push:
-    branches: ["main", "production", "v*"]
+    branches: [ "master" ]
   pull_request:
-    branches: ["main", "production", "v*"]
+    branches: [ "master" ]
   schedule:
-    - cron: "31 13 * * 0"
+    - cron: '26 9 * * 4'
 
 jobs:
   analyze:
@@ -28,6 +28,7 @@ jobs:
     #   - https://gh.io/using-larger-runners (GitHub.com only)
     # Consider using larger runners or machines with greater resources for possible analysis time improvements.
     runs-on: ${{ (matrix.language == 'swift' && 'macos-latest') || 'ubuntu-latest' }}
+    timeout-minutes: ${{ (matrix.language == 'swift' && 120) || 360 }}
     permissions:
       # required for all workflows
       security-events: write
@@ -43,7 +44,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - language: javascript-typescript
+          - language: python
             build-mode: none
         # CodeQL supports the following values keywords for 'language': 'c-cpp', 'csharp', 'go', 'java-kotlin', 'javascript-typescript', 'python', 'ruby', 'swift'
         # Use `c-cpp` to analyze code written in C, C++ or both
