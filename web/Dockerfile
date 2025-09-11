@@ -108,7 +108,7 @@ RUN apk add --no-cache dumb-init tzdata
 RUN addgroup --system --gid 1001 nodejs
 RUN adduser --system --uid 1001 nextjs
 
-RUN npm install -g --no-package-lock --no-save prisma@5.22.0
+RUN npm install -g --no-package-lock --no-save prisma@5.22.0 dd-trace
 
 RUN MIGRATE_TARGET_ARCH=$(echo ${TARGETPLATFORM:-linux/amd64} | sed 's/\//-/g') && \
     wget -q -O- https://github.com/golang-migrate/migrate/releases/download/v4.18.0/migrate.$MIGRATE_TARGET_ARCH.tar.gz | tar xvz && \
@@ -136,7 +136,7 @@ USER nextjs
 ENV PORT 3000
 
 
-ENTRYPOINT ["dumb-init", "--", "./web/entrypoint.sh"]
+ENTRYPOINT ["dumb-init", "--", "node", "-r", "dd-trace/init", "./web/entrypoint.sh"]
 
 # startup command
 CMD ["node", "./web/server.js", "--keepAliveTimeout", "110000"]
