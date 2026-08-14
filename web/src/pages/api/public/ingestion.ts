@@ -6,20 +6,27 @@ import {
   redis,
   logger,
   getCurrentSpan,
+  contextWithLangfuseProps,
+  eventTypes,
+  markProjectIngestFailure,
+  createIngestionAttribution,
 } from "@langfuse/shared/src/server";
 import { telemetry } from "@/src/features/telemetry";
+import { clickHouseRouteForRequest } from "@/src/features/public-api/server/clickHouseRequestTags";
 import { jsonSchema } from "@langfuse/shared";
 import { isPrismaException } from "@/src/utils/exceptions";
 import {
   MethodNotAllowedError,
   BaseError,
   UnauthorizedError,
+  ForbiddenError,
 } from "@langfuse/shared";
-import { instrumentSync, processEventBatch } from "@langfuse/shared/src/server";
+import { processEventBatch } from "@langfuse/shared/src/server";
 import { prisma } from "@langfuse/shared/src/db";
-import { tokenCount } from "@/src/features/ingest/usage";
 import { ApiAuthService } from "@/src/features/public-api/server/apiAuth";
 import { RateLimitService } from "@/src/features/public-api/server/RateLimitService";
+import * as opentelemetry from "@opentelemetry/api";
+import { env } from "@/src/env.mjs";
 
 export const config = {
   api: {
@@ -49,6 +56,8 @@ export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse,
 ) {
+  let projectIdForIngestFailure: string | undefined;
+
   try {
     await runMiddleware(req, res, cors);
 
@@ -79,72 +88,148 @@ export default async function handler(
     if (!authCheck.validKey) {
       throw new UnauthorizedError(authCheck.error);
     }
-
-    try {
-      const rateLimitCheck = await new RateLimitService(redis).rateLimitRequest(
-        authCheck.scope,
-        "ingestion",
+    if (!authCheck.scope.projectId) {
+      throw new UnauthorizedError(
+        "Missing projectId in scope. Are you using an organization key?",
       );
+    }
+    const projectId = authCheck.scope.projectId;
+    projectIdForIngestFailure = projectId;
 
-      if (rateLimitCheck?.isRateLimited()) {
-        return rateLimitCheck.sendRestResponseIfLimited(res);
-      }
-    } catch (e) {
-      // If rate-limiter returns an error, we log it and continue processing.
-      // This allows us to fail open instead of reject requests.
-      logger.error("Error while rate limiting", e);
+    if (authCheck.scope.isIngestionSuspended) {
+      throw new ForbiddenError(
+        "Ingestion suspended: Usage threshold exceeded. Please upgrade your plan.",
+      );
     }
 
-    const batchType = z.object({
-      batch: z.array(z.unknown()),
-      metadata: jsonSchema.nullish(),
+    const ctx = contextWithLangfuseProps({
+      headers: req.headers,
+      projectId,
+      apiKeyId: authCheck.scope.apiKeyId,
+      clickhouse: {
+        surface: "publicapi",
+        route: clickHouseRouteForRequest(req),
+      },
     });
+    // Execute the rest of the handler within the context
+    return opentelemetry.context.with(ctx, async () => {
+      try {
+        try {
+          const rateLimitCheck =
+            await RateLimitService.getInstance().rateLimitRequest(
+              authCheck.scope,
+              "ingestion",
+            );
 
-    const parsedSchema = instrumentSync(
-      { name: "ingestion-zod-parse-unknown-batch-event" },
-      () => batchType.safeParse(req.body),
-    );
+          if (rateLimitCheck?.isRateLimited()) {
+            return rateLimitCheck.sendRestResponseIfLimited(res);
+          }
+        } catch (e) {
+          // If rate-limiter returns an error, we log it and continue processing.
+          // This allows us to fail open instead of reject requests.
+          logger.error("Error while rate limiting", e);
+        }
 
-    if (!parsedSchema.success) {
-      logger.info("Invalid request data", parsedSchema.error);
-      return res.status(400).json({
-        message: "Invalid request data",
-        errors: parsedSchema.error.issues.map((issue) => issue.message),
-      });
-    }
+        const batchType = z.object({
+          batch: z.array(z.unknown()),
+          metadata: jsonSchema.nullish(),
+        });
 
-    await telemetry();
+        const parsedSchema = batchType.safeParse(req.body);
 
-    const result = await processEventBatch(
-      parsedSchema.data.batch,
-      authCheck,
-      tokenCount,
-    );
-    return res.status(207).json(result);
+        if (!parsedSchema.success) {
+          logger.info("Invalid request data", parsedSchema.error);
+          return res.status(400).json({
+            message: "Invalid request data",
+            errors: parsedSchema.error.issues.map((issue) => issue.message),
+          });
+        }
+
+        await telemetry();
+
+        // V4 events_only mode: refuse trace/observation events because their
+        // writes would land in the legacy ClickHouse tables this deployment no
+        // longer reads. Scores and SDK logs are unaffected and pass through.
+        // Reject per-event so a mixed batch still processes its score events.
+        const isEventsOnlyMode =
+          env.LANGFUSE_MIGRATION_V4_WRITE_MODE === "events_only";
+        const { batchForProcessing, rejectedErrors } = filterBatchForEventsOnly(
+          parsedSchema.data.batch,
+          isEventsOnlyMode,
+        );
+
+        const attribution = createIngestionAttribution({
+          headers: req.headers,
+          authCheck,
+        });
+
+        if (isEventsOnlyMode && rejectedErrors.length > 0) {
+          logger.warn(
+            `Rejected ${rejectedErrors.length} event(s) from the legacy /api/public/ingestion endpoint for project ${projectId} because this Langfuse v4 deployment runs in events_only mode. These events were not stored. ${EVENTS_ONLY_INGESTION_REMEDIATION}`,
+            {
+              sdkName: attribution.ingestionSdkName,
+              sdkVersion: attribution.ingestionSdkVersion,
+            },
+          );
+        }
+
+        const result = await processEventBatch(batchForProcessing, authCheck, {
+          attribution,
+        });
+        if (rejectedErrors.length > 0) {
+          result.errors = [...result.errors, ...rejectedErrors];
+        }
+        return res.status(207).json(result);
+      } catch (error) {
+        if (!(error instanceof BaseError && error.isUserError())) {
+          markProjectIngestFailure(projectId, {
+            source: "public_ingestion_api",
+            reason: "api_internal_error",
+          });
+        }
+        throw error;
+      }
+    });
   } catch (error: unknown) {
-    if (!(error instanceof UnauthorizedError)) {
-      logger.error("error_handling_ingestion_event", error);
-      traceException(error);
-    }
-
     if (error instanceof BaseError) {
+      if (!error.isUserError()) {
+        logger.error(error);
+        traceException(error);
+        if (projectIdForIngestFailure) {
+          markProjectIngestFailure(projectIdForIngestFailure, {
+            source: "public_ingestion_api",
+            reason: "api_internal_error",
+          });
+        }
+      }
+
       return res.status(error.httpCode).json({
         error: error.name,
         message: error.message,
       });
     }
 
-    if (isPrismaException(error)) {
-      return res.status(500).json({
-        error: "Internal Server Error",
+    if (error instanceof z.ZodError) {
+      logger.error(`Zod exception`, error.issues);
+      return res.status(400).json({
+        message: "Invalid request data",
+        error: error.issues,
       });
     }
 
-    if (error instanceof z.ZodError) {
-      logger.error(`Zod exception`, error.errors);
-      return res.status(400).json({
-        message: "Invalid request data",
-        error: error.errors,
+    logger.error("error_handling_ingestion_event", error);
+    traceException(error);
+
+    if (projectIdForIngestFailure) {
+      markProjectIngestFailure(projectIdForIngestFailure, {
+        source: "public_ingestion_api",
+        reason: "api_internal_error",
+      });
+    }
+
+    if (isPrismaException(error)) {
+      return res.status(500).json({
+        error: "Internal Server Error",
       });
     }
 
@@ -155,4 +240,70 @@ export default async function handler(
       errors: [errorMessage],
     });
   }
+}
+
+// Event types that may continue to ingest in V4 events_only mode. Scores keep
+// their own ClickHouse table (no legacy traces/observations write); SDK logs
+// are non-persisting.
+const EVENTS_ONLY_ALLOWED_TYPES = new Set<string>([
+  eventTypes.SCORE_CREATE,
+  eventTypes.SDK_LOG,
+]);
+
+const EVENTS_ONLY_INGESTION_DOCS_URL =
+  "https://langfuse.com/self-hosting/upgrade/upgrade-guides/upgrade-v3-to-v4";
+
+const EVENTS_ONLY_INGESTION_REMEDIATION = [
+  "Upgrade the client or integration to a v4-compatible SDK or OTLP ingestion path.",
+  "As a temporary migration bridge, set LANGFUSE_MIGRATION_V4_WRITE_MODE=dual on both the web and worker services and redeploy.",
+  `Docs: ${EVENTS_ONLY_INGESTION_DOCS_URL}`,
+].join(" ");
+
+function filterBatchForEventsOnly(
+  batch: unknown[],
+  isEventsOnlyMode: boolean,
+): {
+  batchForProcessing: unknown[];
+  rejectedErrors: {
+    id: string;
+    status: number;
+    message: string;
+    error: string;
+  }[];
+} {
+  if (!isEventsOnlyMode) {
+    return { batchForProcessing: batch, rejectedErrors: [] };
+  }
+
+  const batchForProcessing: unknown[] = [];
+  const rejectedErrors: {
+    id: string;
+    status: number;
+    message: string;
+    error: string;
+  }[] = [];
+
+  for (const event of batch) {
+    const eventObj =
+      typeof event === "object" && event !== null
+        ? (event as { id?: unknown; type?: unknown })
+        : null;
+    const type =
+      eventObj && typeof eventObj.type === "string" ? eventObj.type : null;
+    const id =
+      eventObj && typeof eventObj.id === "string" ? eventObj.id : "unknown";
+
+    if (type && EVENTS_ONLY_ALLOWED_TYPES.has(type)) {
+      batchForProcessing.push(event);
+    } else {
+      rejectedErrors.push({
+        id,
+        status: 400,
+        message: "Event type not accepted",
+        error: `Event type "${type ?? "unknown"}" is not accepted by /api/public/ingestion when LANGFUSE_MIGRATION_V4_WRITE_MODE is events_only. This endpoint only accepts score and log events. ${EVENTS_ONLY_INGESTION_REMEDIATION}`,
+      });
+    }
+  }
+
+  return { batchForProcessing, rejectedErrors };
 }

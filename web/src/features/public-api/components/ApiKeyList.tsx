@@ -3,18 +3,12 @@ import { Button } from "@/src/components/ui/button";
 import { Card } from "@/src/components/ui/card";
 import { CodeView } from "@/src/components/ui/CodeJsonViewer";
 import { Input } from "@/src/components/ui/input";
-import {
-  Dialog,
-  DialogContent,
-  DialogFooter,
-  DialogHeader,
-  DialogTitle,
-  DialogTrigger,
-} from "@/src/components/ui/dialog";
+import { ConfirmDialog } from "@/src/components/ui/confirm-dialog";
 import {
   Table,
   TableBody,
   TableCell,
+  TableCellWithCopyButton,
   TableHead,
   TableHeader,
   TableRow,
@@ -22,35 +16,67 @@ import {
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 import { CreateApiKeyButton } from "@/src/features/public-api/components/CreateApiKeyButton";
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
-import { api } from "@/src/utils/api";
-import { DialogDescription } from "@radix-ui/react-dialog";
+import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
+import { api, reportNonTrpcError } from "@/src/utils/api";
 import { TrashIcon } from "lucide-react";
 import { useState } from "react";
 import { Alert, AlertDescription, AlertTitle } from "@/src/components/ui/alert";
+import startCase from "lodash/startCase";
+import { useLangfuseEnvCode } from "@/src/features/public-api/hooks/useLangfuseEnvCode";
 
-export function ApiKeyList(props: { projectId: string }) {
-  const hasAccess = useHasProjectAccess({
-    projectId: props.projectId,
-    scope: "apiKeys:read",
+type ApiKeyScope = "project" | "organization";
+type ApiKeyEntity = { id: string; note: string | null };
+type ApiKeyCreator = {
+  createdByUser: {
+    id: string;
+    name: string | null;
+    email: string | null;
+  } | null;
+  createdByApiKey: { id: string; publicKey: string } | null;
+};
+
+export function ApiKeyList(props: { entityId: string; scope: ApiKeyScope }) {
+  const { entityId, scope } = props;
+  const envCode = useLangfuseEnvCode();
+
+  if (!entityId) {
+    throw new Error(
+      `${scope}Id is required for ApiKeyList with scope ${scope}`,
+    );
+  }
+
+  const hasProjectAccess = useHasProjectAccess({
+    projectId: props.entityId,
+    scope: "apiKeys:CUD",
+  });
+  const hasOrganizationAccess = useHasOrganizationAccess({
+    organizationId: props.entityId,
+    scope: "organization:CRUD_apiKeys",
   });
 
-  const apiKeys = api.apiKeys.byProjectId.useQuery(
-    {
-      projectId: props.projectId,
-    },
-    {
-      enabled: hasAccess,
-    },
+  const hasAccess =
+    props.scope === "project" ? hasProjectAccess : hasOrganizationAccess;
+
+  const projectApiKeysQuery = api.projectApiKeys.byProjectId.useQuery(
+    { projectId: entityId },
+    { enabled: hasProjectAccess && props.scope === "project" },
   );
+  const organizationApiKeysQuery =
+    api.organizationApiKeys.byOrganizationId.useQuery(
+      { orgId: entityId },
+      { enabled: hasOrganizationAccess && props.scope === "organization" },
+    );
+  const apiKeysQuery =
+    props.scope === "project" ? projectApiKeysQuery : organizationApiKeysQuery;
 
   if (!hasAccess) {
     return (
       <div>
-        <Header title="API Keys" level="h3" />
+        <Header title="API Keys" />
         <Alert>
           <AlertTitle>Access Denied</AlertTitle>
           <AlertDescription>
-            You do not have permission to view API keys for this project.
+            You do not have permission to view API keys for this {scope}.
           </AlertDescription>
         </Alert>
       </div>
@@ -58,14 +84,32 @@ export function ApiKeyList(props: { projectId: string }) {
   }
 
   return (
-    <div>
-      <Header title="API Keys" level="h3" />
-      <Card className="mb-4">
+    <div className="space-y-4">
+      <Header
+        title={startCase(`${scope} API keys`)}
+        help={{
+          description: `Learn more about ${scope} API keys`,
+          href:
+            scope === "project"
+              ? "https://langfuse.com/docs/api#authentication"
+              : "https://langfuse.com/docs/api#org-scoped-routes",
+        }}
+        actionButtons={<CreateApiKeyButton entityId={entityId} scope={scope} />}
+      />
+      <CodeView
+        content={envCode}
+        title=".env"
+        copiedToClipboardMessage="Secrets are not included, create a new key to copy them."
+      />
+      <Card className="mb-4 overflow-hidden">
         <Table>
           <TableHeader>
             <TableRow>
-              <TableHead className="hidden text-primary md:table-cell">
+              <TableHead className="text-primary hidden md:table-cell">
                 Created
+              </TableHead>
+              <TableHead className="text-primary hidden md:table-cell">
+                Created By
               </TableHead>
               <TableHead className="text-primary">Note</TableHead>
               <TableHead className="text-primary">Public Key</TableHead>
@@ -75,40 +119,58 @@ export function ApiKeyList(props: { projectId: string }) {
             </TableRow>
           </TableHeader>
           <TableBody className="text-muted-foreground">
-            {apiKeys.data?.length === 0 ? (
+            {apiKeysQuery.data?.length === 0 ? (
               <TableRow>
-                <TableCell colSpan={6} className="text-center">
+                <TableCell
+                  density="comfortable"
+                  colSpan={6}
+                  className="text-center"
+                >
                   None
                 </TableCell>
               </TableRow>
             ) : (
-              apiKeys.data?.map((apiKey) => (
+              apiKeysQuery.data?.map((apiKey) => (
                 <TableRow
                   key={apiKey.id}
                   className="hover:bg-primary-foreground"
                 >
-                  <TableCell className="hidden md:table-cell">
+                  <TableCell
+                    density="comfortable"
+                    className="hidden md:table-cell"
+                  >
                     {apiKey.createdAt.toLocaleDateString()}
                   </TableCell>
-                  <TableCell>
-                    <ApiKeyNote apiKey={apiKey} projectId={props.projectId} />
+                  <TableCell
+                    density="comfortable"
+                    className="hidden md:table-cell"
+                  >
+                    <ApiKeyCreatedBy apiKey={apiKey} />
                   </TableCell>
-                  <TableCell className="font-mono">
-                    <CodeView
-                      className="inline-block text-xs"
-                      content={apiKey.publicKey}
+                  <TableCell density="comfortable">
+                    <ApiKeyNote
+                      apiKey={apiKey}
+                      entityId={entityId}
+                      scope={scope}
                     />
                   </TableCell>
-                  <TableCell className="font-mono">
+                  <TableCellWithCopyButton
+                    density="comfortable"
+                    text={apiKey.publicKey}
+                    className="truncate font-mono"
+                    title={apiKey.publicKey}
+                  />
+                  <TableCell density="comfortable" className="font-mono">
                     {apiKey.displaySecretKey}
                   </TableCell>
                   {/* <TableCell>
                   {apiKey.lastUsedAt?.toLocaleDateString() ?? "Never"}
                 </TableCell> */}
-                  <TableCell>
+                  <TableCell density="comfortable">
                     <DeleteApiKeyButton
-                      projectId={props.projectId}
+                      entityId={entityId}
                       apiKeyId={apiKey.id}
+                      scope={scope}
                     />
                   </TableCell>
                 </TableRow>
@@ -117,88 +179,137 @@ export function ApiKeyList(props: { projectId: string }) {
           </TableBody>
         </Table>
       </Card>
-      <CreateApiKeyButton projectId={props.projectId} />
     </div>
   );
 }
 
 // show dialog to let user confirm that this is a destructive action
-function DeleteApiKeyButton(props: { projectId: string; apiKeyId: string }) {
+function DeleteApiKeyButton(props: {
+  entityId: string;
+  apiKeyId: string;
+  scope: ApiKeyScope;
+}) {
+  const { entityId, apiKeyId, scope } = props;
   const capture = usePostHogClientCapture();
-  const hasAccess = useHasProjectAccess({
-    projectId: props.projectId,
+
+  const hasProjectAccess = useHasProjectAccess({
+    projectId: props.entityId,
     scope: "apiKeys:CUD",
   });
+  const hasOrganizationAccess = useHasOrganizationAccess({
+    organizationId: props.entityId,
+    scope: "organization:CRUD_apiKeys",
+  });
+
+  const hasAccess =
+    props.scope === "project" ? hasProjectAccess : hasOrganizationAccess;
 
   const utils = api.useUtils();
-  const mutDeleteApiKey = api.apiKeys.delete.useMutation({
-    onSuccess: () => utils.apiKeys.invalidate(),
+
+  const mutDeleteProjectApiKey = api.projectApiKeys.delete.useMutation({
+    onSuccess: () => utils.projectApiKeys.invalidate(),
   });
+  const mutDeleteOrgApiKey = api.organizationApiKeys.delete.useMutation({
+    onSuccess: () => utils.organizationApiKeys.invalidate(),
+  });
+
   const [open, setOpen] = useState(false);
 
   if (!hasAccess) return null;
 
+  const handleDelete = () => {
+    if (scope === "project") {
+      mutDeleteProjectApiKey
+        .mutateAsync({
+          projectId: entityId,
+          id: apiKeyId,
+        })
+        .then(() => {
+          capture(`${scope}_settings:api_key_delete`);
+          setOpen(false);
+        })
+        .catch((error) => reportNonTrpcError(error, "api-keys"));
+    } else {
+      mutDeleteOrgApiKey
+        .mutateAsync({
+          orgId: entityId,
+          id: apiKeyId,
+        })
+        .then(() => {
+          capture(`${scope}_settings:api_key_delete`);
+          setOpen(false);
+        })
+        .catch((error) => reportNonTrpcError(error, "api-keys"));
+    }
+  };
+
   return (
-    <Dialog open={open} onOpenChange={setOpen}>
-      <DialogTrigger asChild>
+    <ConfirmDialog
+      open={open}
+      onOpenChange={setOpen}
+      trigger={
         <Button variant="ghost" size="icon">
           <TrashIcon className="h-4 w-4" />
         </Button>
-      </DialogTrigger>
-      <DialogContent>
-        <DialogHeader>
-          <DialogTitle className="mb-5">Delete API key</DialogTitle>
-        </DialogHeader>
-        <DialogDescription>
-          Are you sure you want to delete this API key? This action cannot be
-          undone.
-        </DialogDescription>
-        <DialogFooter>
-          <Button
-            variant="destructive"
-            onClick={() => {
-              mutDeleteApiKey
-                .mutateAsync({
-                  projectId: props.projectId,
-                  id: props.apiKeyId,
-                })
-                .then(() => {
-                  capture("project_settings:api_key_delete");
-                  setOpen(false);
-                })
-                .catch((error) => {
-                  console.error(error);
-                });
-            }}
-            loading={mutDeleteApiKey.isLoading}
-          >
-            Permanently delete
-          </Button>
-          <Button variant="ghost" onClick={() => setOpen(false)}>
-            Cancel
-          </Button>
-        </DialogFooter>
-      </DialogContent>
-    </Dialog>
+      }
+      title="Delete API key"
+      description="Are you sure you want to delete this API key? This action cannot be undone."
+      confirmLabel="Permanently delete"
+      loading={mutDeleteOrgApiKey.isPending || mutDeleteProjectApiKey.isPending}
+      onConfirm={handleDelete}
+    />
   );
+}
+
+function ApiKeyCreatedBy({ apiKey }: { apiKey: ApiKeyCreator }) {
+  if (apiKey.createdByUser) {
+    const { name, email } = apiKey.createdByUser;
+    return (
+      <span className="truncate" title={email ?? undefined}>
+        {name ?? email ?? "Unknown user"}
+      </span>
+    );
+  }
+  if (apiKey.createdByApiKey) {
+    return (
+      <span
+        className="truncate font-mono"
+        title={`Created via API by key ${apiKey.createdByApiKey.publicKey}`}
+      >
+        {apiKey.createdByApiKey.publicKey}
+      </span>
+    );
+  }
+  return <span>—</span>;
 }
 
 function ApiKeyNote({
   apiKey,
-  projectId,
+  entityId,
+  scope,
 }: {
-  apiKey: { id: string; note: string | null };
-  projectId: string;
+  apiKey: ApiKeyEntity;
+  entityId: string;
+  scope: ApiKeyScope;
 }) {
   const utils = api.useUtils();
-  const updateNote = api.apiKeys.updateNote.useMutation({
-    onSuccess: () => {
-      utils.apiKeys.invalidate();
-    },
-  });
-  const hasEditAccess = useHasProjectAccess({
-    projectId,
+
+  const hasProjectAccess = useHasProjectAccess({
+    projectId: entityId,
     scope: "apiKeys:CUD",
+  });
+  const hasOrganizationAccess = useHasOrganizationAccess({
+    organizationId: entityId,
+    scope: "organization:CRUD_apiKeys",
+  });
+  const hasEditAccess =
+    scope === "project" ? hasProjectAccess : hasOrganizationAccess;
+
+  const mutUpdateProjectApiKey = api.projectApiKeys.updateNote.useMutation({
+    onSuccess: () => utils.projectApiKeys.invalidate(),
+  });
+  const mutUpdateOrgApiKey = api.organizationApiKeys.updateNote.useMutation({
+    onSuccess: () => utils.organizationApiKeys.invalidate(),
   });
 
   const [note, setNote] = useState(apiKey.note ?? "");
@@ -207,11 +318,19 @@ function ApiKeyNote({
   const handleBlur = () => {
     setIsEditing(false);
     if (note !== apiKey.note) {
-      updateNote.mutate({
-        projectId,
-        keyId: apiKey.id,
-        note,
-      });
+      if (scope === "project") {
+        mutUpdateProjectApiKey.mutate({
+          projectId: entityId,
+          keyId: apiKey.id,
+          note,
+        });
+      } else {
+        mutUpdateOrgApiKey.mutate({
+          orgId: entityId,
+          keyId: apiKey.id,
+          note,
+        });
+      }
     }
   };
 
@@ -232,7 +351,7 @@ function ApiKeyNote({
   return (
     <div
       onClick={() => setIsEditing(true)}
-      className="-mx-2 cursor-pointer rounded px-2 py-1 hover:bg-secondary/50"
+      className="hover:bg-secondary/50 -mx-2 cursor-pointer rounded px-2 py-1"
     >
       {note || "Click to add note"}
     </div>

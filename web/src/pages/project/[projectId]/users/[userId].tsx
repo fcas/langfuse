@@ -1,5 +1,4 @@
 import { useRouter } from "next/router";
-import Header from "@/src/components/layouts/header";
 import { api } from "@/src/utils/api";
 import TracesTable from "@/src/components/table/use-cases/traces";
 import ScoresTable from "@/src/components/table/use-cases/scores";
@@ -7,28 +6,47 @@ import { compactNumberFormatter, usdFormatter } from "@/src/utils/numbers";
 import { StringParam, useQueryParam, withDefault } from "use-query-params";
 import { DetailPageNav } from "@/src/features/navigate-detail-pages/DetailPageNav";
 import SessionsTable from "@/src/components/table/use-cases/sessions";
-import { useClickhouse } from "@/src/components/layouts/ClickhouseAdminToggle";
+import { cn } from "@/src/utils/tailwind";
+import { Badge } from "@/src/components/ui/badge";
+import { ActionButton } from "@/src/components/ActionButton";
+import { LayoutDashboard } from "lucide-react";
+import Page from "@/src/components/layouts/page";
+import { useV4Beta } from "@/src/features/events/hooks/useV4Beta";
+import { ObservationsEventsTable } from "@/src/features/events/components";
 
-const tabs = ["Overview", "Sessions", "Traces", "Scores"] as const;
+const tabs = ["Traces", "Sessions", "Scores"] as const;
 
 export default function UserPage() {
   const router = useRouter();
   const userId = router.query.userId as string;
   const projectId = router.query.projectId as string;
+  const { isBetaEnabled } = useV4Beta();
+
+  const userV3 = api.users.byId.useQuery(
+    {
+      projectId: projectId,
+      userId,
+    },
+    { enabled: !isBetaEnabled },
+  );
+
+  const userV4 = api.users.byIdFromEvents.useQuery(
+    {
+      projectId: projectId,
+      userId,
+    },
+    { enabled: isBetaEnabled },
+  );
+
+  const user = isBetaEnabled ? userV4 : userV3;
 
   const [currentTab, setCurrentTab] = useQueryParam(
     "tab",
     withDefault(StringParam, tabs[0]),
   );
 
-  function classNames(...classes: string[]) {
-    return classes.filter(Boolean).join(" ");
-  }
-
   const renderTabContent = () => {
     switch (currentTab as (typeof tabs)[number]) {
-      case "Overview":
-        return <OverviewTab userId={userId} projectId={projectId} />;
       case "Sessions":
         return <SessionsTab userId={userId} projectId={projectId} />;
       case "Traces":
@@ -51,65 +69,104 @@ export default function UserPage() {
   };
 
   return (
-    <div>
-      <Header
-        title="User Detail"
-        breadcrumb={[
-          { name: "Users", href: `/project/${projectId}/users` },
-          { name: userId },
-        ]}
-        actionButtons={
-          <DetailPageNav
-            currentId={encodeURIComponent(userId)}
-            path={(entry) =>
-              `/project/${projectId}/users/${encodeURIComponent(entry.id)}`
-            }
-            listKey="users"
-          />
-        }
-      />
+    <Page
+      headerProps={{
+        title: userId,
+        breadcrumb: [{ name: "Users", href: `/project/${projectId}/users` }],
+        itemType: "USER",
+        actionButtonsRight: (
+          <>
+            <ActionButton
+              href={`/project/${projectId}?filter=user%3Bstring%3B%3B%3D%3B${userId}`} // dashboard filter serialization
+              variant="secondary"
+              icon={<LayoutDashboard className="h-4 w-4" />}
+            >
+              Dashboard
+            </ActionButton>
+            <DetailPageNav
+              currentId={encodeURIComponent(userId)}
+              path={(entry) =>
+                `/project/${projectId}/users/${encodeURIComponent(entry.id)}`
+              }
+              listKey="users"
+            />
+          </>
+        ),
+      }}
+    >
+      <>
+        {user.data && (
+          <div className="flex flex-wrap gap-2 px-4 py-4">
+            <Badge variant="outline">
+              Observations:{" "}
+              {compactNumberFormatter(user.data.totalObservations)}
+            </Badge>
+            <Badge variant="outline">
+              Traces: {compactNumberFormatter(user.data.totalTraces)}
+            </Badge>
+            <Badge variant="outline">
+              Total Tokens: {compactNumberFormatter(user.data.totalTokens)}
+            </Badge>
+            <Badge variant="outline">
+              <span className="flex items-center gap-1">
+                Total Cost: {usdFormatter(user.data.sumCalculatedTotalCost)}
+              </span>
+            </Badge>
+            <Badge variant="outline">
+              Active:{" "}
+              {user.data.firstTrace
+                ? `${user.data.firstTrace.toLocaleString()} - ${user.data.lastTrace?.toLocaleString()}`
+                : isBetaEnabled
+                  ? "No activity yet"
+                  : "No traces yet"}
+            </Badge>
+          </div>
+        )}
 
-      <div>
-        <div className="sm:hidden">
-          <label htmlFor="tabs" className="sr-only">
-            Select a tab
-          </label>
-          <select
-            id="tabs"
-            name="tabs"
-            className="block w-full rounded-md border-border py-2 pl-3 pr-10 text-base focus:outline-none sm:text-sm"
-            defaultValue={currentTab}
-            onChange={(e) => handleTabChange(e.currentTarget.value)}
-          >
-            {tabs.map((tab) => (
-              <option key={tab}>{tab}</option>
-            ))}
-          </select>
-        </div>
-        <div className="hidden sm:block">
-          <div className="border-b border-border">
-            <nav className="-mb-px flex space-x-8" aria-label="Tabs">
+        <div className="border-border border-t" />
+
+        <div>
+          <div className="sm:hidden">
+            <label htmlFor="tabs" className="sr-only">
+              Select a tab
+            </label>
+            <select
+              id="tabs"
+              name="tabs"
+              className="border-border bg-background text-foreground block w-full rounded-md py-2 pr-10 pl-3 text-base focus:outline-hidden sm:text-sm"
+              defaultValue={currentTab}
+              onChange={(e) => handleTabChange(e.currentTarget.value)}
+            >
               {tabs.map((tab) => (
-                <button
-                  key={tab}
-                  className={classNames(
-                    tab === currentTab
-                      ? "border-primary-accent text-primary-accent"
-                      : "border-transparent text-muted-foreground hover:border-border hover:text-primary",
-                    "whitespace-nowrap border-b-2 px-1 py-4 text-sm font-medium",
-                  )}
-                  aria-current={tab === currentTab ? "page" : undefined}
-                  onClick={() => handleTabChange(tab)}
-                >
-                  {tab}
-                </button>
+                <option key={tab}>{tab}</option>
               ))}
-            </nav>
+            </select>
+          </div>
+          <div className="hidden sm:block">
+            <div className="border-border border-b">
+              <nav className="-mb-px flex" aria-label="Tabs">
+                {tabs.map((tab) => (
+                  <button
+                    key={tab}
+                    className={cn(
+                      tab === currentTab
+                        ? "border-primary-accent text-foreground"
+                        : "text-muted-foreground hover:border-border hover:text-foreground border-transparent",
+                      "border-b-2 px-4 py-3 text-sm font-bold whitespace-nowrap",
+                    )}
+                    aria-current={tab === currentTab ? "page" : undefined}
+                    onClick={() => handleTabChange(tab)}
+                  >
+                    {tab}
+                  </button>
+                ))}
+              </nav>
+            </div>
           </div>
         </div>
-        {renderTabContent()}
-      </div>
-    </div>
+        <div className="flex flex-1 overflow-hidden">{renderTabContent()}</div>
+      </>
+    </Page>
   );
 }
 
@@ -118,98 +175,47 @@ type TabProps = {
   projectId: string;
 };
 
-function OverviewTab({ userId, projectId }: TabProps) {
-  const user = api.users.byId.useQuery({
-    projectId: projectId,
-    userId,
-    queryClickhouse: useClickhouse(),
-  });
-
-  const userData: { value: string; label: string }[] = user.data
-    ? [
-        { label: "User Id", value: user.data.userId },
-        {
-          label: "First Trace",
-          value: user.data.firstTrace?.toLocaleString() ?? "No event yet",
-        },
-        {
-          label: "Last Trace",
-          value: user.data.lastTrace?.toLocaleString() ?? "No event yet",
-        },
-        {
-          label: "Total Observations",
-          value: compactNumberFormatter(user.data.totalObservations),
-        },
-        {
-          label: "Total Traces",
-          value: compactNumberFormatter(user.data.totalTraces),
-        },
-        {
-          label: "Prompt Tokens",
-          value: compactNumberFormatter(user.data.totalPromptTokens),
-        },
-        {
-          label: "Completion Tokens",
-          value: compactNumberFormatter(user.data.totalCompletionTokens),
-        },
-        {
-          label: "Total Tokens",
-          value: compactNumberFormatter(user.data.totalTokens),
-        },
-        {
-          label: "Total Cost",
-          value: usdFormatter(user.data.sumCalculatedTotalCost),
-        },
-      ]
-    : [];
-
-  return (
-    <div className="mt-6 border-t border-muted">
-      <dl className="divide-y divide-muted">
-        {userData.map((item) => (
-          <div
-            key={item.label}
-            className="px-4 py-2 sm:grid sm:grid-cols-3 sm:gap-4 sm:px-0"
-          >
-            <dt className="text-sm font-medium leading-6 text-primary">
-              {item.label}
-            </dt>
-            <dd className="mt-1 text-xs leading-6 text-primary sm:col-span-2 sm:mt-0">
-              {item.value ?? "-"}
-            </dd>
-          </div>
-        ))}
-      </dl>
-    </div>
-  );
-}
-
 function ScoresTab({ userId, projectId }: TabProps) {
   return (
     <ScoresTable
       projectId={projectId}
       userId={userId}
-      omittedFilter={["User ID"]}
+      hiddenColumns={["userId"]}
     />
   );
 }
 
 function TracesTab({ userId, projectId }: TabProps) {
+  const { isBetaEnabled } = useV4Beta();
+
+  if (isBetaEnabled) {
+    return (
+      <ObservationsEventsTable
+        projectId={projectId}
+        userId={userId}
+        omittedFilter={["userId"]}
+      />
+    );
+  }
+
   return (
     <TracesTable
       projectId={projectId}
       userId={userId}
-      omittedFilter={["User ID"]}
+      omittedFilter={["userId"]}
     />
   );
 }
 
 function SessionsTab({ userId, projectId }: TabProps) {
+  const { isBetaEnabled } = useV4Beta();
+
   return (
     <SessionsTable
       projectId={projectId}
       userId={userId}
-      omittedFilter={["User IDs"]}
+      omittedFilter={["userIds"]}
+      isBetaEnabled={isBetaEnabled}
     />
   );
 }

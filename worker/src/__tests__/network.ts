@@ -12,21 +12,14 @@ const DEFAULT_RESPONSE = {
       index: 0,
       message: {
         role: "assistant",
-        content: null,
-        tool_calls: [
-          {
-            function: {
-              name: "extract",
-              arguments: JSON.stringify({
-                score: 0,
-                reasoning:
-                  "The provided text is a harmless play on words that poses no risk of harm or offense. It is a lighthearted joke that uses wordplay to create humor without targeting or derogating any group of people.",
-              }),
-              type: "tool_call",
-              id: "call_cJ6HLI1gZSIRJVOrFsChO1SI",
-            },
-          },
-        ],
+        // AI SDK structured outputs use OpenAI response_format and return the
+        // validated object as JSON text, rather than the legacy LangChain
+        // extraction tool-call shape.
+        content: JSON.stringify({
+          score: 0,
+          reasoning:
+            "The provided text is a harmless play on words that poses no risk of harm or offense. It is a lighthearted joke that uses wordplay to create humor without targeting or derogating any group of people.",
+        }),
       },
       logprobs: null,
       finish_reason: "stop",
@@ -62,14 +55,14 @@ function MinioCompletionHandler() {
 }
 
 function ClickHouseCompletionHandler() {
-  return http.all("http://localhost:8123*", async (request) => {
+  return http.all("http://localhost:8123*", async () => {
     logger.info("clickhouse handler");
     return passthrough();
   });
 }
 
 function AzuriteCompletionHandler() {
-  return http.all("http://localhost:10000*", async (request) => {
+  return http.all("http://localhost:10000*", async () => {
     logger.info("handle azurite");
     return passthrough();
   });

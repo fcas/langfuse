@@ -1,32 +1,20 @@
 // Langfuse Cloud only
 
-import { Button } from "@/src/components/ui/button";
-import { api } from "@/src/utils/api";
-import { Flex, MarkerBar, Metric, Text } from "@tremor/react";
-import Link from "next/link";
 import Header from "@/src/components/layouts/header";
-import { useQueryOrganization } from "@/src/features/organizations/hooks";
-import { Card } from "@/src/components/ui/card";
-import { numberFormatter, compactNumberFormatter } from "@/src/utils/numbers";
 import { useHasEntitlement } from "@/src/features/entitlements/hooks";
-import { type Plan, planLabels } from "@langfuse/shared";
 import { useRouter } from "next/router";
-import {
-  chatAvailable,
-  sendUserChatMessage,
-} from "@/src/features/support-chat/chat";
-import { env } from "@/src/env.mjs";
 import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { Alert, AlertDescription, AlertTitle } from "@/src/components/ui/alert";
-import { MAX_EVENTS_FREE_PLAN } from "@/src/ee/features/billing/constants";
-import {
-  Dialog,
-  DialogContent,
-  DialogHeader,
-  DialogTrigger,
-} from "@/src/components/ui/dialog";
-import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
-import { stripeProducts } from "@/src/ee/features/billing/utils/stripeProducts";
+
+import { BillingUsageChart } from "./BillingUsageChart";
+import { BillingActionButtons } from "./BillingActionButtons";
+import { BillingScheduleNotification } from "./BillingScheduleNotification";
+import { BillingInvoiceTable } from "./BillingInvoiceTable";
+import { BillingDiscountView } from "./BillingDiscountView";
+import { BillingPlanPeriodView } from "@/src/ee/features/billing/components/BillingPlanPeriodView";
+import { useIsCloudBillingAvailable } from "@/src/ee/features/billing/utils/isCloudBilling";
+import { SpendAlertsSection } from "./SpendAlerts/SpendAlertsSection";
+import { useBillingInformation } from "./useBillingInformation";
 
 export const BillingSettings = () => {
   const router = useRouter();
@@ -36,10 +24,22 @@ export const BillingSettings = () => {
     scope: "langfuseCloudBilling:CRUD",
   });
 
-  const entitled = useHasEntitlement("cloud-billing");
-  if (!entitled) return null;
+  const isCloudBillingAvailable = useIsCloudBillingAvailable();
+  const isCloudBillingEntitled = useHasEntitlement("cloud-billing");
+  const isSpendAlertEntitled = useHasEntitlement("cloud-spend-alerts");
+  const { hasActiveSubscription } = useBillingInformation();
 
-  if (!hasAccess)
+  // Don't render billing settings if cloud billing is not available
+  if (!isCloudBillingAvailable) {
+    return null;
+  }
+
+  // Handle conditional rendering without early returns
+  if (!isCloudBillingEntitled) {
+    return null;
+  }
+
+  if (!hasAccess) {
     return (
       <Alert>
         <AlertTitle>Access Denied</AlertTitle>
@@ -49,203 +49,23 @@ export const BillingSettings = () => {
         </AlertDescription>
       </Alert>
     );
-  return (
-    <div>
-      <Header title="Usage & Billing" level="h3" />
-      <OrganizationUsageChart />
-    </div>
-  );
-};
-
-const OrganizationUsageChart = () => {
-  const organization = useQueryOrganization();
-  const usage = api.cloudBilling.getUsage.useQuery(
-    {
-      orgId: organization?.id as string,
-    },
-    {
-      enabled: organization !== undefined,
-      trpc: {
-        context: {
-          skipBatch: true,
-        },
-      },
-    },
-  );
-  const hobbyPlanLimit =
-    organization?.cloudConfig?.monthlyObservationLimit ?? MAX_EVENTS_FREE_PLAN;
-  const plan: Plan = organization?.plan ?? "cloud:hobby";
-  const planLabel = planLabels[plan];
-  const usageType = usage.data?.usageType
-    ? usage.data.usageType.charAt(0).toUpperCase() +
-      usage.data.usageType.slice(1)
-    : "Events";
-
-  return (
-    <div>
-      <Card className="p-3">
-        {usage.data !== undefined ? (
-          <>
-            <Text>
-              {usage.data.billingPeriod
-                ? `${usageType} in current billing period`
-                : `${usageType} / last 30d`}
-            </Text>
-            <Metric>{numberFormatter(usage.data.usageCount, 0)}</Metric>
-            {plan === "cloud:hobby" && (
-              <>
-                <Flex className="mt-4">
-                  <Text>{`${numberFormatter((usage.data.usageCount / hobbyPlanLimit) * 100)}%`}</Text>
-                  <Text>
-                    Plan limit: {compactNumberFormatter(hobbyPlanLimit)}
-                  </Text>
-                </Flex>
-                <MarkerBar
-                  value={Math.min(
-                    (usage.data.usageCount / hobbyPlanLimit) * 100,
-                    100,
-                  )}
-                  className="mt-3"
-                />
-              </>
-            )}
-          </>
-        ) : (
-          <span className="text-sm text-muted-foreground">
-            Loading (might take a moment) ...
-          </span>
-        )}
-      </Card>
-      <div className="mt-2 flex flex-col gap-1 text-sm text-muted-foreground">
-        <p>Current plan: {planLabel}</p>
-        {usage.data?.billingPeriod && (
-          <p>
-            {`Billing period: ${usage.data.billingPeriod.start.toLocaleDateString()} - ${usage.data.billingPeriod.end.toLocaleDateString()}`}
-          </p>
-        )}
-        {usage.data?.upcomingInvoice && (
-          <p>
-            {`Next invoice (current usage): ${usage.data.upcomingInvoice.usdAmount} USD`}
-          </p>
-        )}
-      </div>
-      <div className="mt-4 flex flex-row items-center gap-2">
-        <BillingPortalOrPricingPageButton />
-        <Button variant="secondary" asChild>
-          <Link href={"https://langfuse.com/pricing"} target="_blank">
-            Compare plans
-          </Link>
-        </Button>
-      </div>
-    </div>
-  );
-};
-
-const BillingPortalOrPricingPageButton = () => {
-  const organization = useQueryOrganization();
-  const router = useRouter();
-  const capture = usePostHogClientCapture();
-  const billingPortalUrl = api.cloudBilling.getStripeCustomerPortalUrl.useQuery(
-    {
-      orgId: organization?.id as string,
-    },
-    {
-      enabled: organization !== undefined,
-      refetchOnMount: false,
-      refetchOnReconnect: false,
-      refetchOnWindowFocus: false,
-    },
-  );
-
-  const mutCreateCheckoutSession =
-    api.cloudBilling.createStripeCheckoutSession.useMutation({
-      onSuccess: (url) => {
-        router.push(url);
-      },
-    });
-
-  if (!organization) return null;
-  if (billingPortalUrl.isLoading) return null;
-  if (billingPortalUrl.data)
-    return (
-      <Button asChild>
-        <Link href={billingPortalUrl.data}>Billing portal</Link>
-      </Button>
-    );
-
-  // Do not show checkout or customer portal if manual plan is set in cloud config
-  if (organization.cloudConfig?.plan) {
-    if (chatAvailable)
-      return (
-        <Button
-          variant="secondary"
-          onClick={() =>
-            sendUserChatMessage(
-              `I'd like to change my current plan, region ${env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION}, organization id ${organization.id}`,
-            )
-          }
-        >
-          Change plan
-        </Button>
-      );
-    else return null;
   }
 
-  // Show pricing page button
   return (
-    <Dialog
-      onOpenChange={(open) => {
-        if (open) {
-          capture("project_settings:pricing_dialog_opened");
-        }
-      }}
-    >
-      <DialogTrigger asChild>
-        <Button>Change plan</Button>
-      </DialogTrigger>
-      <DialogContent className="max-w-3xl">
-        <DialogHeader>
-          <Header
-            title="Plans"
-            level="h3"
-            actionButtons={
-              <Button variant="secondary" asChild>
-                <Link href="https://langfuse.com/pricing" target="_blank">
-                  Comparison of plans ↗
-                </Link>
-              </Button>
-            }
-          />
-        </DialogHeader>
-        <div className="mb-3 flex flex-col justify-center gap-10 md:flex-row">
-          {stripeProducts
-            .filter((product) => Boolean(product.checkout))
-            .map((product) => (
-              <div
-                key={product.stripeProductId}
-                className="flex flex-1 flex-col"
-              >
-                <div className="mb-2 text-lg font-semibold">
-                  {product.checkout?.title}
-                </div>
-                <div>{product.checkout?.description}</div>
-                <div className="mb-6 mt-2">{product.checkout?.price}</div>
-                <Button
-                  onClick={() => {
-                    if (organization)
-                      mutCreateCheckoutSession.mutate({
-                        orgId: organization.id,
-                        stripeProductId: product.stripeProductId,
-                      });
-                  }}
-                  className="mt-auto"
-                >
-                  Select plan
-                </Button>
-              </div>
-            ))}
-        </div>
-      </DialogContent>
-    </Dialog>
+    <div>
+      <BillingScheduleNotification />
+
+      <Header title="Usage & Billing" />
+      <div className="space-y-6">
+        <BillingUsageChart />
+        <BillingPlanPeriodView />
+        <BillingDiscountView />
+        <BillingActionButtons />
+        <BillingInvoiceTable />
+        {isSpendAlertEntitled && orgId && hasActiveSubscription && (
+          <SpendAlertsSection orgId={orgId} />
+        )}
+      </div>
+    </div>
   );
 };

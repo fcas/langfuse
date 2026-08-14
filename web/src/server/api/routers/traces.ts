@@ -1,222 +1,206 @@
 import { z } from "zod";
-import { env } from "@/src/env.mjs";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { aggregateScores } from "@/src/features/scores/lib/aggregateScores";
+import { applyCommentFilters } from "@langfuse/shared/src/server";
 import {
   createTRPCRouter,
   protectedGetTraceProcedure,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
 import {
+  BatchActionQuerySchema,
+  BatchTableNames,
+  BatchExportTableName,
+  BatchActionType,
+  ActionId,
   filterAndValidateDbScoreList,
+  normalizeOrderByForTable,
   orderBy,
   paginationZod,
   singleFilter,
   timeFilter,
-  type TraceOptions,
-  tracesTableUiColumnDefinitions,
+  type Observation,
+  hasValidTracingSearchTypes,
+  TRACING_SEARCH_TYPE_REQUIRED_MESSAGE,
+  TracingSearchType,
+  type ScoreDomain,
+  ScoreDataTypeArray,
+  ScoreDataTypeEnum,
+  LISTABLE_SCORE_TYPES,
 } from "@langfuse/shared";
 import {
-  type ObservationView,
-  Prisma,
-  type Trace,
-} from "@langfuse/shared/src/db";
-import {
-  datetimeFilterToPrisma,
-  datetimeFilterToPrismaSql,
   traceException,
-  createTracesQuery,
-  parseTraceAllFilters,
   getTracesTable,
   getTracesTableCount,
   getScoresForTraces,
-  getScoresGroupedByName,
+  getNumericScoresGroupedByName,
+  getBooleanScoresGroupedByName,
   getTracesGroupedByName,
   getTracesGroupedByTags,
-  getObservationsViewForTrace,
-  deleteTraces,
-  deleteScoresByTraceIds,
-  deleteObservationsByTraceIds,
+  getObservationsForTrace,
   getTraceById,
   logger,
   upsertTrace,
   convertTraceDomainToClickhouse,
-  hasAnyTrace,
-  QueueJobs,
-  TraceDeleteQueue,
+  hasAnyTracingData,
+  traceDeletionProcessor,
   getTracesTableMetrics,
-  type TracesAllUiReturnType,
-  type TracesMetricsUiReturnType,
+  getCategoricalScoresGroupedByName,
+  convertDateToClickhouseDateTime,
+  getAgentGraphData,
+  tracesTableUiColumnDefinitions,
+  getTracesGroupedByUsers,
+  getTracesGroupedBySessionId,
+  updateEvents,
+  getScoresAndCorrectionsForTraces,
 } from "@langfuse/shared/src/server";
 import { TRPCError } from "@trpc/server";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
-import { randomUUID } from "crypto";
+import { createBatchActionJob } from "@/src/features/table/server/createBatchActionJob";
+import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
+import { sanitizeLegacyTracingSearch } from "@/src/features/traces/server/legacyIoSearch";
+import {
+  type AgentGraphDataResponse,
+  AgentGraphDataSchema,
+} from "@/src/features/trace-graph-view/types";
+import { env } from "@/src/env.mjs";
+import {
+  toDomainWithStringifiedMetadata,
+  toDomainArrayWithStringifiedMetadata,
+} from "@/src/utils/clientSideDomainTypes";
+import { scoreFilters } from "@/src/features/scores/lib/scoreColumns";
+import partition from "lodash/partition";
 
-const TraceFilterOptions = z.object({
-  projectId: z.string(), // Required for protectedProjectProcedure
-  searchQuery: z.string().nullable(),
-  filter: z.array(singleFilter).nullable(),
-  orderBy: orderBy,
+const TraceCountOptions = z
+  .object({
+    projectId: z.string(), // Required for protectedProjectProcedure
+    searchQuery: z.string().nullable(),
+    searchType: z.array(TracingSearchType),
+    filter: z.array(singleFilter).nullable(),
+    orderBy: orderBy,
+  })
+  .refine(hasValidTracingSearchTypes, {
+    message: TRACING_SEARCH_TYPE_REQUIRED_MESSAGE,
+    path: ["searchType"],
+  });
+const TraceFilterOptions = TraceCountOptions.safeExtend({
   ...paginationZod,
 });
 type TraceFilterOptions = z.infer<typeof TraceFilterOptions>;
 
-export type ObservationReturnType = Omit<
-  ObservationView,
-  "input" | "output" | "inputPrice" | "outputPrice" | "totalPrice" | "metadata"
+export type ObservationReturnTypeWithMetadata = Omit<
+  Observation,
+  "input" | "output" | "metadata"
 > & {
   traceId: string;
-  usageDetails: Record<string, number>;
-  costDetails: Record<string, number>;
+  metadata: string | null;
+  traceName?: string | null;
+  traceTags?: string[];
+  // optional, because in v4 an observation can have those properties
+  userId?: string | null;
+  sessionId?: string | null;
+  release?: string | null;
 };
 
+export type ObservationReturnType = Omit<
+  ObservationReturnTypeWithMetadata,
+  "metadata"
+>;
+
 export const traceRouter = createTRPCRouter({
-  hasAny: protectedProjectProcedure
+  hasTracingConfigured: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
-        queryClickhouse: z.boolean().default(false),
       }),
     )
     .query(async ({ input, ctx }) => {
-      return await measureAndReturnApi({
-        input,
-        operation: "traces.hasAny",
-        user: ctx.session.user,
-        pgExecution: async () => {
-          const hasAny = await ctx.prisma.trace.findFirst({
-            where: {
-              projectId: input.projectId,
-            },
-            select: {
-              id: true,
-            },
-          });
-          return hasAny !== null;
+      // Check if there is any tracing data in the database
+      const hasTraces = await hasAnyTracingData(input.projectId);
+
+      if (hasTraces) {
+        return true;
+      }
+
+      // If no traces, check if data retention is configured
+      // This indicates the user has configured tracing even if data retention cleaned all traces
+      const project = await ctx.prisma.project.findUnique({
+        where: {
+          id: input.projectId,
         },
-        clickhouseExecution: async () => {
-          return await hasAnyTrace(input.projectId);
+        select: {
+          retentionDays: true,
         },
       });
+
+      return !!(project?.retentionDays && project.retentionDays > 0);
     }),
   all: protectedProjectProcedure
-    .input(
-      TraceFilterOptions.extend({
-        queryClickhouse: z.boolean().default(false),
-      }),
-    )
+    .input(TraceFilterOptions)
     .query(async ({ input, ctx }) => {
-      return await measureAndReturnApi({
-        input,
-        operation: "traces.all",
-        user: ctx.session.user,
-        pgExecution: async () => {
-          const {
-            filterCondition,
-            orderByCondition,
-            observationTimeseriesFilter,
-            searchCondition,
-          } = parseTraceAllFilters(input);
-
-          const tracesQuery = createTracesQuery({
-            select: Prisma.sql`
-            t.*,
-            t."user_id" AS "userId",
-            t.session_id AS "sessionId"
-            `,
-            projectId: input.projectId,
-            observationTimeseriesFilter,
-            page: input.page,
-            limit: input.limit,
-            searchCondition,
-            filterCondition,
-            orderByCondition,
-          });
-
-          const traces = await ctx.prisma.$queryRaw<Array<Trace>>(tracesQuery);
-
-          return {
-            traces: traces.map<TracesAllUiReturnType>(
-              // eslint-disable-next-line @typescript-eslint/no-unused-vars
-              ({ input, output, metadata, ...trace }) => ({
-                ...trace,
-                name: trace.name,
-                release: trace.release,
-                version: trace.version,
-                externalId: trace.externalId,
-                userId: trace.userId,
-                sessionId: trace.sessionId,
-              }),
-            ),
-          };
-        },
-        clickhouseExecution: async () => {
-          const res = await getTracesTable(
-            ctx.session.projectId,
-            input.filter ?? [],
-            input.searchQuery ?? undefined,
-            input.orderBy,
-            input.limit,
-            input.page,
-          );
-
-          return {
-            traces: res,
-          };
-        },
+      const search = sanitizeLegacyTracingSearch({
+        searchQuery: input.searchQuery,
+        searchType: input.searchType,
+        tableName: BatchTableNames.Traces,
       });
+
+      const { filterState, hasNoMatches } = await applyCommentFilters({
+        filterState: input.filter ?? [],
+        prisma: ctx.prisma,
+        projectId: ctx.session.projectId,
+        objectType: "TRACE",
+      });
+
+      if (hasNoMatches) {
+        return { traces: [] };
+      }
+
+      const traces = await getTracesTable({
+        projectId: ctx.session.projectId,
+        filter: filterState,
+        searchQuery: search.searchQuery,
+        searchType: search.searchType ?? ["id"],
+        orderBy: normalizeOrderByForTable({
+          orderBy: input.orderBy,
+          expectedTimeColumn: "timestamp",
+        }),
+        limit: input.limit,
+        page: input.page,
+      });
+      return { traces };
     }),
   countAll: protectedProjectProcedure
-    .input(
-      TraceFilterOptions.extend({
-        queryClickhouse: z.boolean().default(false),
-      }),
-    )
+    .input(TraceCountOptions)
     .query(async ({ input, ctx }) => {
-      return await measureAndReturnApi({
-        input,
-        operation: "traces.countAll",
-        user: ctx.session.user,
-        pgExecution: async () => {
-          const {
-            filterCondition,
-            observationTimeseriesFilter,
-            searchCondition,
-          } = parseTraceAllFilters(input);
-
-          const countQuery = createTracesQuery({
-            select: Prisma.sql`count(*)`,
-            projectId: input.projectId,
-            observationTimeseriesFilter,
-            page: 0,
-            limit: 1,
-            searchCondition,
-            filterCondition,
-          });
-
-          const totalTraces =
-            await ctx.prisma.$queryRaw<Array<{ count: bigint }>>(countQuery);
-
-          const totalTraceCount = totalTraces[0]?.count;
-          return {
-            totalCount: totalTraceCount ? Number(totalTraceCount) : undefined,
-          };
-        },
-        clickhouseExecution: async () => {
-          const countQuery = await getTracesTableCount({
-            projectId: ctx.session.projectId,
-            filter: input.filter ?? [],
-            searchQuery: input.searchQuery ?? undefined,
-            limit: 1,
-            page: 0,
-          });
-
-          return {
-            totalCount: countQuery,
-          };
-        },
+      const search = sanitizeLegacyTracingSearch({
+        searchQuery: input.searchQuery,
+        searchType: input.searchType,
+        tableName: BatchTableNames.Traces,
       });
+
+      const { filterState, hasNoMatches } = await applyCommentFilters({
+        filterState: input.filter ?? [],
+        prisma: ctx.prisma,
+        projectId: ctx.session.projectId,
+        objectType: "TRACE",
+      });
+
+      if (hasNoMatches) {
+        return { totalCount: 0 };
+      }
+
+      const count = await getTracesTableCount({
+        projectId: ctx.session.projectId,
+        filter: filterState,
+        searchType: search.searchType ?? ["id"],
+        searchQuery: search.searchQuery,
+        limit: 1,
+        page: 0,
+      });
+
+      return {
+        totalCount: count,
+      };
     }),
   metrics: protectedProjectProcedure
     .input(
@@ -224,193 +208,154 @@ export const traceRouter = createTRPCRouter({
         projectId: z.string(),
         traceIds: z.array(z.string()),
         filter: z.array(singleFilter).nullable(),
-        queryClickhouse: z.boolean().default(false),
       }),
     )
     .query(async ({ input, ctx }) => {
       if (input.traceIds.length === 0) return [];
-      return await measureAndReturnApi({
-        input,
-        operation: "traces.metrics",
-        user: ctx.session.user,
-        pgExecution: async () => {
-          const tracesQuery = createTracesQuery({
-            select: Prisma.sql`
-          t.id,
-          COALESCE(generation_metrics."promptTokens", 0)::bigint AS "promptTokens",
-          COALESCE(generation_metrics."completionTokens", 0)::bigint AS "completionTokens",
-          COALESCE(generation_metrics."totalTokens", 0)::bigint AS "totalTokens",
-          observation_metrics.latency AS "latency",
-          observation_metrics."observationCount" AS "observationCount",
-          COALESCE(generation_metrics."calculatedTotalCost", 0)::numeric AS "calculatedTotalCost",
-          COALESCE(generation_metrics."calculatedInputCost", 0)::numeric AS "calculatedInputCost",
-          COALESCE(generation_metrics."calculatedOutputCost", 0)::numeric AS "calculatedOutputCost",
-          observation_metrics."level" AS "level"
-        `,
-            projectId: input.projectId,
-            filterCondition: Prisma.sql`AND t.id IN (${Prisma.join(input.traceIds)})`,
-          });
 
-          const [traceMetrics, scores] = await Promise.all([
-            // traceMetrics
-            ctx.prisma.$queryRaw<Array<TracesMetricsUiReturnType>>(tracesQuery),
-            // scores
-            ctx.prisma.score.findMany({
-              where: {
-                projectId: input.projectId,
-                traceId: {
-                  in: input.traceIds,
-                },
-              },
-            }),
-          ]);
+      const { filterState, hasNoMatches, matchingIds } =
+        await applyCommentFilters({
+          filterState: input.filter ?? [],
+          prisma: ctx.prisma,
+          projectId: ctx.session.projectId,
+          objectType: "TRACE",
+        });
 
-          const validatedScores = filterAndValidateDbScoreList(
-            scores,
-            traceException,
-          );
+      if (hasNoMatches) {
+        return [];
+      }
 
-          return traceMetrics.map((row) => ({
-            ...row,
-            scores: aggregateScores(
-              validatedScores.filter((s) => s.traceId === row.id),
-            ),
-          }));
-        },
-        clickhouseExecution: async () => {
-          const res = await getTracesTableMetrics({
-            projectId: ctx.session.projectId,
-            filter: [
-              ...(input.filter ?? []),
-              {
-                type: "stringOptions",
-                operator: "any of",
-                column: "ID",
-                value: input.traceIds,
-              },
-            ],
-          });
+      // If comment filters returned matching IDs, intersect with input.traceIds
+      let filteredTraceIds = input.traceIds;
+      if (matchingIds !== null) {
+        filteredTraceIds = input.traceIds.filter((id) =>
+          matchingIds.includes(id),
+        );
 
-          const scores = await getScoresForTraces(
-            ctx.session.projectId,
-            res.map((r) => r.id),
-            undefined,
-            1000,
-            0,
-          );
+        if (filteredTraceIds.length === 0) {
+          return [];
+        }
+      }
 
-          const validatedScores = filterAndValidateDbScoreList(
-            scores,
-            traceException,
-          );
+      // Remove the comment filter's ID injection and use filteredTraceIds instead
+      const filterWithoutCommentIds = filterState.filter(
+        (f) =>
+          !(
+            f.type === "stringOptions" &&
+            f.column === "id" &&
+            f.operator === "any of"
+          ),
+      );
 
-          return res.map((row) => ({
-            ...row,
-            scores: aggregateScores(
-              validatedScores.filter((s) => s.traceId === row.id),
-            ),
-          }));
-        },
+      const res = await getTracesTableMetrics({
+        projectId: ctx.session.projectId,
+        filter: [
+          ...filterWithoutCommentIds,
+          {
+            type: "stringOptions",
+            operator: "any of",
+            column: "ID",
+            value: filteredTraceIds,
+          },
+        ],
+        orderBy: { column: "timestamp", order: "DESC" },
       });
+
+      const traceScores = await getScoresForTraces({
+        projectId: ctx.session.projectId,
+        traceIds: res.map((r) => r.id),
+        limit: 1000,
+        offset: 0,
+        excludeMetadata: true,
+        includeHasMetadata: true,
+      });
+
+      const validatedScores = filterAndValidateDbScoreList({
+        scores: traceScores,
+        dataTypes: LISTABLE_SCORE_TYPES,
+        includeHasMetadata: true,
+        onParseError: traceException,
+      });
+
+      return res.map((row) => ({
+        ...row,
+        scores: aggregateScores(
+          validatedScores.filter((s) => s.traceId === row.id),
+        ),
+      }));
     }),
   filterOptions: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
-        timestampFilter: timeFilter.optional(),
-        queryClickhouse: z.boolean().default(false),
+        timestampFilter: z.array(timeFilter).optional(),
       }),
     )
-    .query(async ({ input, ctx }) => {
-      return await measureAndReturnApi({
-        input,
-        operation: "traces.filterOptions",
-        user: ctx.session.user,
-        pgExecution: async () => {
-          const { timestampFilter } = input;
-          const prismaTimestampFilter = timestampFilter
-            ? datetimeFilterToPrisma(timestampFilter)
-            : {};
+    .query(async ({ input }) => {
+      const { timestampFilter } = input;
+      // Trace table filters/columns operate on trace-scoped aggregates: any
+      // score row attached to the trace, whether it lives on the trace itself
+      // or on one of the trace's observations.
+      const traceScopedScoreFilters = [
+        ...(timestampFilter ?? []),
+        ...scoreFilters.forTraceScopedAggregates(),
+      ];
 
-          const rawTimestampFilter =
-            timestampFilter && timestampFilter.type === "datetime"
-              ? datetimeFilterToPrismaSql(
-                  "timestamp",
-                  timestampFilter.operator,
-                  timestampFilter.value,
-                )
-              : Prisma.empty;
+      const [
+        numericScoreNames,
+        categoricalScoreNames,
+        booleanScoreNames,
+        traceNames,
+        tags,
+        userIds,
+        sessionIds,
+      ] = await Promise.all([
+        getNumericScoresGroupedByName(input.projectId, traceScopedScoreFilters),
+        getCategoricalScoresGroupedByName(
+          input.projectId,
+          traceScopedScoreFilters,
+        ),
+        getBooleanScoresGroupedByName(input.projectId, traceScopedScoreFilters),
+        getTracesGroupedByName(
+          input.projectId,
+          tracesTableUiColumnDefinitions,
+          timestampFilter ?? [],
+        ),
+        getTracesGroupedByTags({
+          projectId: input.projectId,
+          filter: timestampFilter ?? [],
+        }),
+        getTracesGroupedByUsers(
+          input.projectId,
+          timestampFilter ?? [],
+          undefined,
+          100,
+          0,
+        ),
+        getTracesGroupedBySessionId(
+          input.projectId,
+          timestampFilter ?? [],
+          undefined,
+          100,
+          0,
+        ),
+      ]);
 
-          const [scores, names, tags] = await Promise.all([
-            ctx.prisma.score.groupBy({
-              where: {
-                projectId: input.projectId,
-                timestamp: prismaTimestampFilter,
-                dataType: { in: ["NUMERIC", "BOOLEAN"] },
-              },
-              take: 1000,
-              orderBy: { name: "asc" },
-              by: ["name"],
-            }),
-            ctx.prisma.trace.groupBy({
-              where: {
-                projectId: input.projectId,
-                timestamp: prismaTimestampFilter,
-              },
-              by: ["name"],
-              // limiting to 1k trace names to avoid performance issues.
-              // some users have unique names for large amounts of traces
-              // sending all trace names to the FE exceeds the cloud function return size limit
-              take: 1000,
-              orderBy: { name: "asc" },
-            }),
-            ctx.prisma.$queryRaw<{ value: string }[]>`
-          SELECT tags.tag as value
-          FROM traces, UNNEST(traces.tags) AS tags(tag)
-          WHERE traces.project_id = ${input.projectId} ${rawTimestampFilter}
-          GROUP BY tags.tag
-          ORDER BY tags.tag ASC
-          LIMIT 1000
-        `,
-          ]);
-          const res: TraceOptions = {
-            scores_avg: scores.map((score) => score.name),
-            name: names
-              .filter((n) => n.name !== null)
-              .map((name) => ({
-                value: name.name ?? "undefined",
-              })),
-            tags: tags,
-          };
-          return res;
-        },
-        clickhouseExecution: async () => {
-          const { timestampFilter } = input;
-
-          const [scoreNames, traceNames, tags] = await Promise.all([
-            getScoresGroupedByName(
-              input.projectId,
-              timestampFilter ? [timestampFilter] : [],
-            ),
-            getTracesGroupedByName(
-              input.projectId,
-              tracesTableUiColumnDefinitions,
-              timestampFilter ? [timestampFilter] : [],
-            ),
-            getTracesGroupedByTags({
-              projectId: input.projectId,
-              filter: timestampFilter ? [timestampFilter] : [],
-            }),
-          ]);
-
-          const res: TraceOptions = {
-            name: traceNames.map((n) => ({ value: n.name })),
-            scores_avg: scoreNames.map((s) => s.name),
-            tags: tags,
-          };
-          return res;
-        },
-      });
+      return {
+        name: traceNames.map((n) => ({ value: n.name, count: n.count })),
+        scores_avg: numericScoreNames.map((s) => s.name),
+        score_categories: categoricalScoreNames,
+        score_booleans: booleanScoreNames.map((s) => s.name),
+        tags: tags,
+        users: userIds.map((u) => ({
+          value: u.user,
+          count: u.count,
+        })),
+        sessions: sessionIds.map((s) => ({
+          value: s.session_id,
+          count: s.count,
+        })),
+      };
     }),
   byId: protectedGetTraceProcedure
     .input(
@@ -418,218 +363,123 @@ export const traceRouter = createTRPCRouter({
         traceId: z.string(), // used for security check
         projectId: z.string(), // used for security check
         timestamp: z.date().nullish(), // timestamp of the trace. Used to query CH more efficiently
-        queryClickhouse: z.boolean().default(false),
+        fromTimestamp: z.date().nullish(), // min timestamp of the trace. Used to query CH more efficiently
+        verbosity: z.enum(["compact", "truncated", "full"]).default("full"),
       }),
     )
-    .query(async ({ input, ctx }) => {
-      return await measureAndReturnApi({
-        input,
-        operation: "traces.byId",
-        user: ctx.session.user ?? undefined,
-        pgExecution: async () => {
-          return ctx.prisma.trace.findFirstOrThrow({
-            where: {
-              id: input.traceId,
-              projectId: input.projectId,
-            },
-          });
-        },
-        clickhouseExecution: async () => {
-          const trace = getTraceById(
-            input.traceId,
-            input.projectId,
-            input.timestamp ?? undefined,
-          );
-          if (!trace) {
-            throw new TRPCError({
-              code: "NOT_FOUND",
-              message: "Trace not found",
-            });
-          }
-          return trace;
-        },
-      });
+    .query(async ({ ctx }) => {
+      if (!ctx.trace) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Trace not found",
+        });
+      }
+      return {
+        ...ctx.trace,
+        input: ctx.trace.input as string,
+        output: ctx.trace.output as string,
+        metadata: ctx.trace.metadata
+          ? JSON.stringify(ctx.trace.metadata)
+          : undefined,
+      };
     }),
   byIdWithObservationsAndScores: protectedGetTraceProcedure
     .input(
       z.object({
         traceId: z.string(), // used for security check
         timestamp: z.date().nullish(), // timestamp of the trace. Used to query CH more efficiently
+        fromTimestamp: z.date().nullish(), // min timestamp of the trace. Used to query CH more efficiently
         projectId: z.string(), // used for security check
-        queryClickhouse: z.boolean().default(false),
       }),
     )
     .query(async ({ input, ctx }) => {
-      return await measureAndReturnApi({
-        input,
-        operation: "traces.byIdWithObservationsAndScores",
-        user: ctx.session.user ?? undefined,
-        pgExecution: async () => {
-          const [trace, observations, scores] = await Promise.all([
-            ctx.prisma.trace.findFirst({
-              where: {
-                id: input.traceId,
-                projectId: input.projectId,
-              },
-            }),
-            ctx.prisma.observationView.findMany({
-              select: {
-                id: true,
-                traceId: true,
-                projectId: true,
-                type: true,
-                startTime: true,
-                endTime: true,
-                name: true,
-                parentObservationId: true,
-                level: true,
-                statusMessage: true,
-                version: true,
-                createdAt: true,
-                model: true,
-                modelParameters: true,
-                promptTokens: true,
-                completionTokens: true,
-                totalTokens: true,
-                unit: true,
-                completionStartTime: true,
-                timeToFirstToken: true,
-                promptId: true,
-                modelId: true,
-                inputPrice: true,
-                outputPrice: true,
-                totalPrice: true,
-                calculatedInputCost: true,
-                calculatedOutputCost: true,
-                calculatedTotalCost: true,
-                promptName: true,
-                promptVersion: true,
-                latency: true,
-                updatedAt: true,
-              },
-              where: {
-                traceId: {
-                  equals: input.traceId,
-                  not: null,
-                },
-                projectId: input.projectId,
-              },
-            }),
-            ctx.prisma.score.findMany({
-              where: {
-                traceId: input.traceId,
-                projectId: input.projectId,
-              },
-            }),
-          ]);
+      if (!ctx.trace) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Trace not found",
+        });
+      }
 
-          if (!trace) {
-            throw new TRPCError({
-              code: "NOT_FOUND",
-              message: "Trace not found",
-            });
-          }
+      const [observations, traceScores] = await Promise.all([
+        getObservationsForTrace({
+          traceId: input.traceId,
+          projectId: input.projectId,
+          timestamp: input.timestamp ?? input.fromTimestamp ?? undefined,
+          includeIO: false,
+        }),
+        getScoresAndCorrectionsForTraces({
+          projectId: input.projectId,
+          traceIds: [input.traceId],
+          timestamp: input.timestamp ?? input.fromTimestamp ?? undefined,
+        }),
+      ]);
 
-          const validatedScores = filterAndValidateDbScoreList(
-            scores,
-            traceException,
-          );
-
-          const obsStartTimes = observations
-            .map((o) => o.startTime)
-            .sort((a, b) => a.getTime() - b.getTime());
-          const obsEndTimes = observations
-            .map((o) => o.endTime)
-            .filter((t) => t)
-            .sort((a, b) => (a as Date).getTime() - (b as Date).getTime());
-          const latencyMs =
-            obsStartTimes.length > 0
-              ? obsEndTimes.length > 0
-                ? (obsEndTimes[obsEndTimes.length - 1] as Date).getTime() -
-                  obsStartTimes[0]!.getTime()
-                : obsStartTimes.length > 1
-                  ? obsStartTimes[obsStartTimes.length - 1]!.getTime() -
-                    obsStartTimes[0]!.getTime()
-                  : undefined
-              : undefined;
-
-          return {
-            ...trace,
-            scores: validatedScores,
-            latency: latencyMs !== undefined ? latencyMs / 1000 : undefined,
-            observations: observations.map((o) => ({
-              ...o,
-              usageDetails: {}, // no usageDetails in legacy postgres
-              costDetails: {}, // no costDetails in legacy postgres
-            })) as ObservationReturnType[],
-          };
-        },
-        clickhouseExecution: async () => {
-          const [trace, observations, scores] = await Promise.all([
-            getTraceById(
-              input.traceId,
-              input.projectId,
-              input.timestamp ?? undefined,
-            ),
-            getObservationsViewForTrace(
-              input.traceId,
-              input.projectId,
-              input.timestamp ?? undefined,
-            ),
-            getScoresForTraces(
-              input.projectId,
-              [input.traceId],
-              input.timestamp ?? undefined,
-              undefined,
-              undefined,
-            ),
-          ]);
-
-          if (!trace) {
-            throw new TRPCError({
-              code: "NOT_FOUND",
-              message: "Trace not found",
-            });
-          }
-
-          const validatedScores = filterAndValidateDbScoreList(
-            scores,
-            traceException,
-          );
-
-          const obsStartTimes = observations
-            .map((o) => o.startTime)
-            .sort((a, b) => a.getTime() - b.getTime());
-          const obsEndTimes = observations
-            .map((o) => o.endTime)
-            .filter((t) => t)
-            .sort((a, b) => (a as Date).getTime() - (b as Date).getTime());
-          const latencyMs =
-            obsStartTimes.length > 0
-              ? obsEndTimes.length > 0
-                ? (obsEndTimes[obsEndTimes.length - 1] as Date).getTime() -
-                  obsStartTimes[0]!.getTime()
-                : obsStartTimes.length > 1
-                  ? obsStartTimes[obsStartTimes.length - 1]!.getTime() -
-                    obsStartTimes[0]!.getTime()
-                  : undefined
-              : undefined;
-
-          return {
-            ...trace,
-            scores: validatedScores,
-            latency: latencyMs !== undefined ? latencyMs / 1000 : undefined,
-            observations: observations as ObservationReturnType[],
-          };
-        },
+      const validatedScores = filterAndValidateDbScoreList({
+        scores: traceScores,
+        dataTypes: [...ScoreDataTypeArray],
+        onParseError: traceException,
       });
+
+      const [corrections, scores] = partition(
+        validatedScores,
+        (s) => s.dataType === ScoreDataTypeEnum.CORRECTION,
+      );
+
+      const obsStartTimes = observations
+        .map((o) => o.startTime)
+        .sort((a, b) => a.getTime() - b.getTime());
+      const obsEndTimes = observations
+        .map((o) => o.endTime)
+        .filter((t) => t)
+        .sort((a, b) => (a as Date).getTime() - (b as Date).getTime());
+      const latencyMs =
+        obsStartTimes.length > 0
+          ? obsEndTimes.length > 0
+            ? (obsEndTimes[obsEndTimes.length - 1] as Date).getTime() -
+              obsStartTimes[0]!.getTime()
+            : obsStartTimes.length > 1
+              ? obsStartTimes[obsStartTimes.length - 1]!.getTime() -
+                obsStartTimes[0]!.getTime()
+              : undefined
+          : undefined;
+
+      const scoresDomain =
+        toDomainArrayWithStringifiedMetadata<ScoreDomain>(scores);
+
+      return {
+        ...toDomainWithStringifiedMetadata(ctx.trace),
+        input: ctx.trace.input ? JSON.stringify(ctx.trace.input) : null,
+        output: ctx.trace.output ? JSON.stringify(ctx.trace.output) : null,
+        scores: scoresDomain,
+        corrections,
+        latency: latencyMs !== undefined ? latencyMs / 1000 : undefined,
+        observations: observations.map((o) => ({
+          ...toDomainWithStringifiedMetadata(o),
+          output: undefined,
+          input: undefined, // this is not queried above.
+        })) as ObservationReturnTypeWithMetadata[],
+      };
     }),
   deleteMany: protectedProjectProcedure
     .input(
-      z.object({
-        traceIds: z.array(z.string()).min(1, "Minimum 1 trace_Id is required."),
-        projectId: z.string(),
-      }),
+      z
+        .object({
+          traceIds: z.array(z.string()),
+          projectId: z.string(),
+          query: BatchActionQuerySchema.optional(),
+          isBatchAction: z.boolean().default(false),
+        })
+        // Batch actions delete by query and ignore traceIds, so an empty list
+        // is valid there (paging/refetch can drain the visible selection while
+        // select-all is armed); only id-based deletes need at least one id.
+        .refine((input) => input.isBatchAction || input.traceIds.length > 0, {
+          message: "Minimum 1 traceId is required.",
+          path: ["traceIds"],
+        })
+        .refine((input) => !input.isBatchAction || input.query !== undefined, {
+          message: "Batch actions require a query.",
+          path: ["query"],
+        }),
     )
     .mutation(async ({ input, ctx }) => {
       throwIfNoProjectAccess({
@@ -638,82 +488,73 @@ export const traceRouter = createTRPCRouter({
         scope: "traces:delete",
       });
 
-      const traceDeleteQueue = TraceDeleteQueue.getInstance();
-
-      for (const traceId of input.traceIds) {
-        await auditLog({
-          resourceType: "trace",
-          resourceId: traceId,
-          action: "delete",
-          session: ctx.session,
-        });
-      }
-
-      if (!traceDeleteQueue) {
-        logger.warn(
-          `TraceDeleteQueue not initialized. Try synchronous deletion for ${input.traceIds.length} traces.`,
-        );
-        await ctx.prisma.$transaction([
-          ctx.prisma.trace.deleteMany({
-            where: {
-              id: {
-                in: input.traceIds,
-              },
-              projectId: input.projectId,
-            },
-          }),
-          ctx.prisma.observation.deleteMany({
-            where: {
-              traceId: {
-                in: input.traceIds,
-              },
-              projectId: input.projectId,
-            },
-          }),
-          ctx.prisma.score.deleteMany({
-            where: {
-              traceId: {
-                in: input.traceIds,
-              },
-              projectId: input.projectId,
-            },
-          }),
-          // given traces and observations live in ClickHouse we cannot enforce a fk relationship and onDelete: setNull
-          ctx.prisma.jobExecution.updateMany({
-            where: {
-              jobInputTraceId: { in: input.traceIds },
-              projectId: input.projectId,
-            },
-            data: {
-              jobInputTraceId: {
-                set: null,
-              },
-              jobInputObservationId: {
-                set: null,
-              },
-            },
-          }),
-        ]);
-
-        if (env.CLICKHOUSE_URL) {
-          await Promise.all([
-            deleteTraces(input.projectId, input.traceIds),
-            deleteObservationsByTraceIds(input.projectId, input.traceIds),
-            deleteScoresByTraceIds(input.projectId, input.traceIds),
-          ]);
-        }
-        return;
-      }
-
-      await traceDeleteQueue.add(QueueJobs.TraceDelete, {
-        timestamp: new Date(),
-        id: randomUUID(),
-        payload: {
-          projectId: input.projectId,
-          traceIds: input.traceIds,
-        },
-        name: QueueJobs.TraceDelete,
+      throwIfNoEntitlement({
+        entitlement: "trace-deletion",
+        projectId: input.projectId,
+        sessionUser: ctx.session.user,
       });
+
+      if (input.isBatchAction && input.query) {
+        // Comment filters (commentCount/commentContent in both the v3 traces
+        // and v4 events views) resolve via Postgres lookups at read time
+        // (applyCommentFilters); when the worker translates the stored
+        // filters into ClickHouse SQL, these columns map to a nonexistent
+        // "comments" table and would deterministically fail every batch, so
+        // reject them at dispatch.
+        const hasCommentFilter = (input.query.filter ?? []).some(
+          (f) => f.column === "commentCount" || f.column === "commentContent",
+        );
+        if (hasCommentFilter) {
+          throw new TRPCError({
+            code: "BAD_REQUEST",
+            message:
+              "Batch deletion does not support comment filters. Remove the comment filter and try again.",
+          });
+        }
+
+        // Decide here whether this delete reads from the events table: the
+        // v4 events view sets query.useEventsTable: true, which we honor
+        // after checking the events view is actually available to this user
+        // (v4 beta flag, or the instance-wide preview opt-in). In every
+        // other case createBatchActionJob infers the choice from the user's
+        // v4 beta flag.
+        const declaresEventsTable = input.query.useEventsTable === true;
+        if (declaresEventsTable) {
+          const eventsSurfaceAvailable =
+            ctx.session.user.v4BetaEnabled === true ||
+            env.LANGFUSE_MIGRATION_V4_ALLOW_PREVIEW_OPT_IN === "true";
+          if (!eventsSurfaceAvailable) {
+            throw new TRPCError({
+              code: "BAD_REQUEST",
+              message:
+                "Events-backed batch deletion is not available for this user on this instance.",
+            });
+          }
+        }
+
+        await createBatchActionJob({
+          projectId: input.projectId,
+          actionId: ActionId.TraceDelete,
+          actionType: BatchActionType.Delete,
+          tableName: BatchExportTableName.Traces,
+          session: ctx.session,
+          query: input.query,
+          useEventsTableOverride: declaresEventsTable ? true : undefined,
+        });
+      } else {
+        await Promise.all(
+          input.traceIds.map((traceId) =>
+            auditLog({
+              resourceType: "trace",
+              resourceId: traceId,
+              action: "delete",
+              session: ctx.session,
+            }),
+          ),
+        );
+
+        await traceDeletionProcessor(input.projectId, input.traceIds);
+      }
     }),
   bookmark: protectedProjectProcedure
     .input(
@@ -739,50 +580,40 @@ export const traceRouter = createTRPCRouter({
         });
 
         let trace;
-        if (env.LANGFUSE_POSTGRES_INGESTION_ENABLED === "true") {
-          trace = await ctx.prisma.trace.update({
-            where: {
-              id: input.traceId,
-              projectId: input.projectId,
-            },
-            data: {
-              bookmarked: input.bookmarked,
-            },
-          });
-        }
 
-        if (env.CLICKHOUSE_URL) {
-          const clickhouseTrace = await getTraceById(
-            input.traceId,
-            input.projectId,
-          );
-          if (clickhouseTrace) {
-            trace = clickhouseTrace;
-            clickhouseTrace.bookmarked = input.bookmarked;
-            await upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace));
-          } else {
-            logger.error(
-              `Trace not found in Clickhouse: ${input.traceId}. Skipping bookmark.`,
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        const clickhouseTrace = await getTraceById({
+          traceId: input.traceId,
+          projectId: input.projectId,
+        });
+        if (clickhouseTrace) {
+          trace = clickhouseTrace;
+          clickhouseTrace.bookmarked = input.bookmarked;
+          const promises = [
+            upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace)),
+          ];
+          if (env.LANGFUSE_MIGRATION_V4_WRITE_MODE !== "legacy") {
+            promises.push(
+              updateEvents(
+                input.projectId,
+                { traceIds: [clickhouseTrace.id], rootOnly: true },
+                { bookmarked: input.bookmarked },
+              ),
             );
           }
+          await Promise.all(promises);
+        } else {
+          logger.error(
+            `Trace not found in Clickhouse: ${input.traceId}. Skipping bookmark.`,
+          );
         }
 
         return trace;
       } catch (error) {
-        console.error(error);
-        if (
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === "P2025" // Record to update not found
-        ) {
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "Trace not found in project",
-          });
-        } else {
-          throw new TRPCError({
-            code: "INTERNAL_SERVER_ERROR",
-          });
-        }
+        logger.error("Failed to call traces.bookmark", error);
+        throw new TRPCError({
+          code: "INTERNAL_SERVER_ERROR",
+        });
       }
     }),
   publish: protectedProjectProcedure
@@ -808,109 +639,110 @@ export const traceRouter = createTRPCRouter({
           after: input.public,
         });
 
-        if (env.LANGFUSE_POSTGRES_INGESTION_ENABLED === "true") {
-          await ctx.prisma.trace.update({
-            where: {
-              id: input.traceId,
-              projectId: input.projectId,
-            },
-            data: {
-              public: input.public,
-            },
-          });
-        }
-
-        if (env.CLICKHOUSE_URL) {
-          const clickhouseTrace = await getTraceById(
-            input.traceId,
-            input.projectId,
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        const clickhouseTrace = await getTraceById({
+          traceId: input.traceId,
+          projectId: input.projectId,
+        });
+        if (!clickhouseTrace) {
+          logger.error(
+            `Trace not found in Clickhouse: ${input.traceId}. Skipping publishing.`,
           );
-          if (!clickhouseTrace) {
-            logger.error(
-              `Trace not found in Clickhouse: ${input.traceId}. Skipping publishing.`,
-            );
-            throw new TRPCError({
-              code: "NOT_FOUND",
-              message: "Trace not found",
-            });
-          }
-          clickhouseTrace.public = input.public;
-          await upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace));
-          return clickhouseTrace;
-        }
-      } catch (error) {
-        console.error(error);
-        if (
-          error instanceof Prisma.PrismaClientKnownRequestError &&
-          error.code === "P2025" // Record to update not found
-        ) {
           throw new TRPCError({
             code: "NOT_FOUND",
-            message: "Trace not found in project",
-          });
-        } else {
-          throw new TRPCError({
-            code: "INTERNAL_SERVER_ERROR",
+            message: "Trace not found",
           });
         }
-      }
-    }),
-  updateTags: protectedProjectProcedure
-    .input(
-      z.object({
-        projectId: z.string(),
-        traceId: z.string(),
-        tags: z.array(z.string()),
-      }),
-    )
-    .mutation(async ({ input, ctx }) => {
-      throwIfNoProjectAccess({
-        session: ctx.session,
-        projectId: input.projectId,
-        scope: "objects:tag",
-      });
-      try {
-        await auditLog({
-          session: ctx.session,
-          resourceType: "trace",
-          resourceId: input.traceId,
-          action: "updateTags",
-          after: input.tags,
-        });
-
-        if (env.LANGFUSE_POSTGRES_INGESTION_ENABLED === "true") {
-          await ctx.prisma.trace.update({
-            where: {
-              id: input.traceId,
-              projectId: input.projectId,
-            },
-            data: {
-              tags: {
-                set: input.tags,
-              },
-            },
-          });
-        }
-
-        if (env.CLICKHOUSE_URL) {
-          const clickhouseTrace = await getTraceById(
-            input.traceId,
-            input.projectId,
+        clickhouseTrace.public = input.public;
+        const promises = [
+          upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace)),
+        ];
+        if (env.LANGFUSE_MIGRATION_V4_WRITE_MODE !== "legacy") {
+          promises.push(
+            updateEvents(
+              input.projectId,
+              { traceIds: [clickhouseTrace.id] },
+              { public: input.public },
+            ),
           );
-          if (!clickhouseTrace) {
-            logger.error(
-              `Trace not found in Clickhouse: ${input.traceId}. Skipping tag update.`,
-            );
-            return;
-          }
-          clickhouseTrace.tags = input.tags;
-          await upsertTrace(convertTraceDomainToClickhouse(clickhouseTrace));
         }
+        await Promise.all(promises);
+        return clickhouseTrace;
       } catch (error) {
-        console.error(error);
+        logger.error("Failed to call traces.publish", error);
         throw new TRPCError({
           code: "INTERNAL_SERVER_ERROR",
         });
       }
+    }),
+  getAgentGraphData: protectedGetTraceProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        traceId: z.string(),
+        minStartTime: z.iso.datetime({ offset: true }),
+        maxStartTime: z.iso.datetime({ offset: true }),
+        // Optional fields for enforceTraceAccess middleware (supports public traces)
+        timestamp: z.date().nullish(),
+        fromTimestamp: z.date().nullish(),
+      }),
+    )
+    .query(async ({ input }): Promise<Required<AgentGraphDataResponse>[]> => {
+      const { traceId, projectId, minStartTime, maxStartTime } = input;
+
+      const chMinStartTime = convertDateToClickhouseDateTime(
+        new Date(minStartTime),
+      );
+      const chMaxStartTime = convertDateToClickhouseDateTime(
+        new Date(maxStartTime),
+      );
+
+      const records = await getAgentGraphData({
+        projectId,
+        traceId,
+        chMinStartTime,
+        chMaxStartTime,
+      });
+
+      const result = records
+        .map((r) => {
+          const parsed = AgentGraphDataSchema.safeParse(r);
+          if (!parsed.success) {
+            return null;
+          }
+
+          const data = parsed.data;
+          const hasLangGraphData = data.step != null && data.node != null;
+          const hasAgentData = data.type !== "EVENT"; // Include all types except EVENT
+
+          if (hasLangGraphData) {
+            return {
+              id: data.id,
+              node: data.node,
+              step: data.step,
+              parentObservationId: data.parent_observation_id || null,
+              name: data.name,
+              startTime: data.start_time,
+              endTime: data.end_time || undefined,
+              observationType: data.type,
+            };
+          } else if (hasAgentData) {
+            return {
+              id: data.id,
+              node: data.name,
+              step: 0,
+              parentObservationId: data.parent_observation_id || null,
+              name: data.name,
+              startTime: data.start_time,
+              endTime: data.end_time || undefined,
+              observationType: data.type,
+            };
+          }
+
+          return null;
+        })
+        .filter((r) => Boolean(r)) as Required<AgentGraphDataResponse>[];
+
+      return result;
     }),
 });

@@ -3,21 +3,24 @@ import {
   PostEventsV1Response,
 } from "@/src/features/public-api/types/events";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { createAuthedAPIRoute } from "@/src/features/public-api/server/createAuthedAPIRoute";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
 import {
+  createIngestionAttribution,
   eventTypes,
   logger,
   processEventBatch,
 } from "@langfuse/shared/src/server";
-import { tokenCount } from "@/src/features/ingest/usage";
 import { v4 } from "uuid";
 
 export default withMiddlewares({
-  POST: createAuthedAPIRoute({
+  POST: createAuthedProjectAPIRoute({
     name: "Create Event",
     bodySchema: PostEventsV1Body,
     responseSchema: PostEventsV1Response,
-    fn: async ({ body, auth, res }) => {
+    // Writes an observation-create event that lands in the legacy observations
+    // ClickHouse table; events_only deployments expect OTel ingestion.
+    rejectInEventsOnlyMode: true,
+    fn: async ({ body, auth, req, res }) => {
       const event = {
         id: v4(),
         type: eventTypes.OBSERVATION_CREATE,
@@ -30,7 +33,12 @@ export default withMiddlewares({
       if (!event.body.id) {
         event.body.id = v4();
       }
-      const result = await processEventBatch([event], auth, tokenCount);
+      const result = await processEventBatch([event], auth, {
+        attribution: createIngestionAttribution({
+          headers: req.headers,
+          authCheck: auth,
+        }),
+      });
       if (result.errors.length > 0) {
         const error = result.errors[0];
         res

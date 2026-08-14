@@ -3,7 +3,6 @@ import Link from "next/link";
 import { Label } from "@/src/components/ui/label";
 import { api } from "@/src/utils/api";
 import { type UIModelParams } from "@langfuse/shared";
-import { ArrowTopRightIcon } from "@radix-ui/react-icons";
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 
 export const LLMApiKeyComponent = (p: {
@@ -18,8 +17,8 @@ export const LLMApiKeyComponent = (p: {
   if (!hasAccess) {
     return (
       <div>
-        <Label className="text-xs font-semibold">API key</Label>
-        <p className="text-sm text-muted-foreground">
+        <Label className="text-xs font-bold">API key</Label>
+        <p className="text-muted-foreground text-sm">
           LLM API Key only visible to Owner and Admin roles.
         </p>
       </div>
@@ -30,11 +29,11 @@ export const LLMApiKeyComponent = (p: {
     projectId: p.projectId,
   });
 
-  if (apiKeys.isLoading) {
+  if (apiKeys.isPending) {
     return (
       <div>
-        <Label className="text-xs font-semibold">API key</Label>
-        <p className="text-sm text-muted-foreground">Loading...</p>
+        <Label className="text-xs font-bold">API key</Label>
+        <p className="text-muted-foreground text-sm">Loading...</p>
       </div>
     );
   }
@@ -44,32 +43,16 @@ export const LLMApiKeyComponent = (p: {
 
   return (
     <div className="space-y-2 text-xs">
-      <Label className="text-xs font-semibold">API key</Label>
+      <Label className="text-xs font-bold">API key</Label>
       <div>
         {apiKey ? (
-          <Link href={`/project/${p.projectId}/settings/api-keys`}>
-            <span className="mr-2 rounded-sm bg-input p-1 text-xs">
+          <Link href={`/project/${p.projectId}/settings/llm-connections`}>
+            <span className="bg-input mr-2 rounded-sm p-1 text-xs">
               {apiKey.displaySecretKey}
             </span>
           </Link>
         ) : undefined}
       </div>
-      {/* Custom form message to include a link to the already existing prompt */}
-      {!apiKey ? (
-        <div className="flex flex-col font-medium text-destructive">
-          {`No LLM API key found for provider ${modelProvider}.`}
-
-          <Link
-            href={`/project/${p.projectId}/settings/api-keys`}
-            className="flex flex-row"
-          >
-            Create a new LLM API key here. <ArrowTopRightIcon />
-          </Link>
-        </div>
-      ) : undefined}
-      <p className="text-muted-foreground">
-        The LLM API key is used for each execution and will incur costs.
-      </p>
     </div>
   );
 };

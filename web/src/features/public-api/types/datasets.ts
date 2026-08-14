@@ -1,14 +1,20 @@
 import {
+  deprecationResponseZod,
   jsonSchema,
   publicApiPaginationZod,
   paginationZod,
   paginationMetaResponseZod,
   queryStringZod,
+  versionZod,
   type DatasetRuns as DbDatasetRuns,
-  type DatasetItem as DbDatasetItems,
-  type DatasetRunItems as DbDatasetRunItems,
+  type Dataset as DbDataset,
   removeObjectKeys,
+  type DatasetRunItemDomain,
+  type DatasetItemDomain,
+  datasetItemMediaFields,
+  stringDateTime,
 } from "@langfuse/shared";
+import { DatasetJSONSchema } from "@langfuse/shared/src/server";
 import { z } from "zod";
 
 /**
@@ -22,6 +28,8 @@ const APIDataset = z
     name: z.string(),
     description: z.string().nullable(),
     metadata: z.any(),
+    inputSchema: z.any().nullable(),
+    expectedOutputSchema: z.any().nullable(),
     createdAt: z.coerce.date(),
     updatedAt: z.coerce.date(),
   })
@@ -53,6 +61,26 @@ const APIDatasetRunItem = z
   })
   .strict();
 
+export type APIDatasetRunItem = z.infer<typeof APIDatasetRunItem>;
+
+const APIDatasetItemMediaReference = z
+  .object({
+    field: z.enum(datasetItemMediaFields),
+    referenceString: z.string(),
+    jsonPath: z.string(),
+    media: z.object({
+      mediaId: z.string(),
+      contentType: z.string(),
+      contentLength: z.number(),
+      url: z.string(),
+      urlExpiry: z.string(),
+    }),
+  })
+  .strict();
+export type APIDatasetItemMediaReference = z.infer<
+  typeof APIDatasetItemMediaReference
+>;
+
 const APIDatasetItem = z
   .object({
     datasetName: z.string(),
@@ -66,6 +94,7 @@ const APIDatasetItem = z
     datasetId: z.string(),
     createdAt: z.coerce.date(),
     updatedAt: z.coerce.date(),
+    mediaReferences: z.array(APIDatasetItemMediaReference),
   })
   .strict();
 
@@ -78,15 +107,45 @@ export const transformDbDatasetRunToAPIDatasetRun = (
 ): z.infer<typeof APIDatasetRun> =>
   removeObjectKeys(dbDatasetRun, ["projectId"]);
 
-export const transformDbDatasetItemToAPIDatasetItem = (
-  dbDatasetItem: DbDatasetItems & { datasetName: string },
-): z.infer<typeof APIDatasetItem> =>
-  removeObjectKeys(dbDatasetItem, ["projectId"]);
+export const transformDbDatasetItemDomainToAPIDatasetItem = (
+  dbDatasetItem: DatasetItemDomain & {
+    datasetName: string;
+  },
+): Omit<z.infer<typeof APIDatasetItem>, "mediaReferences"> =>
+  removeObjectKeys(dbDatasetItem, ["projectId", "validFrom"]);
 
-export const transformDbDatasetRunItemToAPIDatasetRunItem = (
-  dbDatasetRunItem: DbDatasetRunItems & { datasetRunName: string },
+export const transformDbDatasetRunItemToAPIDatasetRunItemCh = (
+  dbDatasetRunItem: DatasetRunItemDomain,
 ): z.infer<typeof APIDatasetRunItem> =>
-  removeObjectKeys(dbDatasetRunItem, ["projectId"]);
+  removeObjectKeys(dbDatasetRunItem, [
+    "projectId",
+    "datasetRunDescription",
+    "datasetRunMetadata",
+    "datasetRunCreatedAt",
+    "datasetItemInput",
+    "datasetItemExpectedOutput",
+    "datasetItemMetadata",
+    "datasetItemVersion",
+    "datasetId",
+    "error",
+  ]);
+
+export const transformDbDatasetToAPIDataset = (
+  dataset: DbDataset,
+): z.infer<typeof APIDataset> =>
+  // The secret-bearing columns (secretKey, requestHeaders) are already
+  // excluded from Prisma results by the global omit in db.ts. Stripping them
+  // here again guarantees that even if an upstream read ever opts back into
+  // them via an explicit select, they can never leave through the public API.
+  removeObjectKeys(dataset, [
+    "remoteExperimentUrl",
+    "remoteExperimentPayload",
+    "remoteExperimentEnabled",
+    "remoteExperimentSecretKey",
+    "remoteExperimentDisplaySecretKey",
+    "remoteExperimentRequestHeaders",
+    "remoteExperimentDisplayHeaders",
+  ]);
 
 /**
  * Endpoints
@@ -97,6 +156,8 @@ export const PostDatasetsV2Body = z.object({
   name: z.string(),
   description: z.string().nullish(),
   metadata: jsonSchema.nullish(),
+  inputSchema: DatasetJSONSchema.nullish(),
+  expectedOutputSchema: DatasetJSONSchema.nullish(),
 });
 export const PostDatasetsV2Response = APIDataset.strict();
 
@@ -126,6 +187,7 @@ export const GetDatasetRunsV1Response = z
   .object({
     data: z.array(APIDatasetRun),
     meta: paginationMetaResponseZod,
+    _deprecation: deprecationResponseZod.optional(),
   })
   .strict();
 
@@ -136,28 +198,49 @@ export const GetDatasetRunV1Query = z.object({
 });
 export const GetDatasetRunV1Response = APIDatasetRun.extend({
   datasetRunItems: z.array(APIDatasetRunItem),
+  _deprecation: deprecationResponseZod.optional(),
 }).strict();
+
+export const publicApiIdSchema = z
+  .string()
+  .min(1, "ID must not be empty")
+  .max(255, "ID must be at most 255 characters");
 
 // POST /dataset-items
 export const PostDatasetItemsV1Body = z.object({
   datasetName: z.string(),
-  input: jsonSchema.nullish(),
-  expectedOutput: jsonSchema.nullish(),
-  metadata: jsonSchema.nullish(),
-  id: z.string().nullish(),
+  input: z.any().nullish(),
+  expectedOutput: z.any().nullish(),
+  metadata: z.any().nullish(),
+  id: publicApiIdSchema.nullish(),
   sourceTraceId: z.string().nullish(),
   sourceObservationId: z.string().nullish(),
   status: z.enum(["ACTIVE", "ARCHIVED"]).nullish(),
 });
-export const PostDatasetItemsV1Response = APIDatasetItem.strict();
+export const PostDatasetItemsV1Response = APIDatasetItem;
 
 // GET /dataset-items
-export const GetDatasetItemsV1Query = z.object({
-  datasetName: z.string().nullish(),
-  sourceTraceId: z.string().nullish(),
-  sourceObservationId: z.string().nullish(),
-  ...publicApiPaginationZod,
-});
+export const GetDatasetItemsV1Query = z
+  .object({
+    datasetName: z.string().nullish(),
+    sourceTraceId: z.string().nullish(),
+    sourceObservationId: z.string().nullish(),
+    version: versionZod.nullish(),
+    ...publicApiPaginationZod,
+  })
+  .refine(
+    (data) => {
+      // If version is provided, datasetName must also be provided
+      if (data.version && !data.datasetName) {
+        return false;
+      }
+      return true;
+    },
+    {
+      message: "datasetName is required when version parameter is provided",
+      path: ["datasetName"],
+    },
+  );
 export const GetDatasetItemsV1Response = z
   .object({
     data: z.array(APIDatasetItem),
@@ -169,7 +252,17 @@ export const GetDatasetItemsV1Response = z
 export const GetDatasetItemV1Query = z.object({
   datasetItemId: z.string(),
 });
-export const GetDatasetItemV1Response = APIDatasetItem.strict();
+export const GetDatasetItemV1Response = APIDatasetItem;
+
+// DELETE /dataset-items/{datasetItemId}
+export const DeleteDatasetItemV1Query = z.object({
+  datasetItemId: z.string(),
+});
+export const DeleteDatasetItemV1Response = z
+  .object({
+    message: z.literal("Dataset item successfully deleted"),
+  })
+  .strict();
 
 // POST /dataset-run-items
 export const PostDatasetRunItemsV1Body = z
@@ -180,6 +273,8 @@ export const PostDatasetRunItemsV1Body = z
     datasetItemId: z.string(),
     observationId: z.string().nullish(),
     traceId: z.string().nullish(),
+    datasetVersion: versionZod.nullish(),
+    createdAt: stringDateTime,
   })
   .strict()
   .refine((data) => data.observationId || data.traceId, {
@@ -187,6 +282,20 @@ export const PostDatasetRunItemsV1Body = z
     path: ["observationId", "traceId"], // Specify the path of the error
   });
 export const PostDatasetRunItemsV1Response = APIDatasetRunItem.strict();
+
+// GET /dataset-run-items
+export const GetDatasetRunItemsV1Query = z.object({
+  datasetId: z.string(),
+  runName: z.string(),
+  ...publicApiPaginationZod,
+});
+export const GetDatasetRunItemsV1Response = z
+  .object({
+    data: z.array(APIDatasetRunItem),
+    meta: paginationMetaResponseZod,
+    _deprecation: deprecationResponseZod.optional(),
+  })
+  .strict();
 
 /**
  * Deprecated endpoints replaced with v2, available for backward compatibility
@@ -197,6 +306,8 @@ export const PostDatasetsV1Body = z.object({
   name: z.string(),
   description: z.string().nullish(),
   metadata: jsonSchema.nullish(),
+  inputSchema: DatasetJSONSchema.nullish(),
+  expectedOutputSchema: DatasetJSONSchema.nullish(),
 });
 export const PostDatasetsV1Response = APIDataset.extend({
   items: z.array(APIDatasetItem),
@@ -227,3 +338,14 @@ export const GetDatasetV1Response = APIDataset.extend({
   items: z.array(APIDatasetItem),
   runs: z.array(z.string()), // dataset run names
 }).strict();
+
+// DELETE /datasets/{name}/runs/{runName}
+export const DeleteDatasetRunV1Query = z.object({
+  name: queryStringZod, // dataset name from URL
+  runName: queryStringZod,
+});
+export const DeleteDatasetRunV1Response = z
+  .object({
+    message: z.literal("Dataset run successfully deleted"),
+  })
+  .strict();

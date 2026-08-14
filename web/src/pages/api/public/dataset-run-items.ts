@@ -1,129 +1,58 @@
-import { prisma } from "@langfuse/shared/src/db";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { createAuthedAPIRoute } from "@/src/features/public-api/server/createAuthedAPIRoute";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
 import {
+  GetDatasetRunItemsV1Query,
+  GetDatasetRunItemsV1Response,
   PostDatasetRunItemsV1Body,
   PostDatasetRunItemsV1Response,
-  transformDbDatasetRunItemToAPIDatasetRunItem,
 } from "@/src/features/public-api/types/datasets";
-import { LangfuseNotFoundError, InvalidRequestError } from "@langfuse/shared";
-import { addDatasetRunItemsToEvalQueue } from "@/src/ee/features/evals/server/addDatasetRunItemsToEvalQueue";
-import { getObservationById } from "@langfuse/shared/src/server";
+import {
+  createDatasetRunItemForApi,
+  buildStableDatasetRunItemResponseEventsOnly,
+  listDatasetRunItemsForApi,
+} from "@/src/features/datasets/server/publicDatasetService";
+import { DATASET_RUN_ITEMS_DEPRECATION } from "@/src/features/public-api/server/deprecations";
 import { env } from "@/src/env.mjs";
 
 export default withMiddlewares({
-  POST: createAuthedAPIRoute({
+  POST: createAuthedProjectAPIRoute({
     name: "Create Dataset Run Item",
     bodySchema: PostDatasetRunItemsV1Body,
     responseSchema: PostDatasetRunItemsV1Response,
-    fn: async ({ body, auth }) => {
-      const {
-        datasetItemId,
-        observationId,
-        traceId,
-        runName,
-        runDescription,
-        metadata,
-      } = body;
-
-      /**************
-       * VALIDATION *
-       **************/
-
-      const datasetItem = await prisma.datasetItem.findUnique({
-        where: {
-          id_projectId: {
-            projectId: auth.scope.projectId,
-            id: datasetItemId,
-          },
-          status: "ACTIVE",
-        },
-        include: {
-          dataset: true,
-        },
-      });
-
-      if (!datasetItem) {
-        throw new LangfuseNotFoundError("Dataset item not found or not active");
+    rateLimitResource: "datasets",
+    // Writes a dataset-run-item event into the legacy dataset_run_items
+    // ClickHouse table. events_only deployments no longer populate that table,
+    // so instead of writing anything we return a stable experiment id (== the
+    // dataset run id) derived deterministically from (projectId, datasetId,
+    // runName). The trace ↔ experiment link is established through OTel
+    // experiment span attributes on ingestion instead.
+    fn: async ({ body, auth, res }) => {
+      if (env.LANGFUSE_MIGRATION_V4_WRITE_MODE === "events_only") {
+        return await buildStableDatasetRunItemResponseEventsOnly({
+          body,
+          auth,
+        });
       }
-
-      let finalTraceId = traceId;
-
-      // Backwards compatibility: historically, dataset run items were linked to observations, not traces
-      if (!traceId && observationId) {
-        const observation =
-          env.LANGFUSE_RETURN_FROM_CLICKHOUSE === "true"
-            ? await getObservationById(
-                observationId,
-                auth.scope.projectId,
-                true,
-              )
-            : await prisma.observation.findUnique({
-                where: {
-                  id: observationId,
-                  projectId: auth.scope.projectId,
-                },
-              });
-
-        if (observationId && !observation) {
-          throw new LangfuseNotFoundError("Observation not found");
-        }
-        finalTraceId = observation?.traceId;
-      }
-
-      if (!finalTraceId) {
-        throw new InvalidRequestError("No traceId set");
-      }
-
-      /********************
-       * RUN ITEM CREATION *
-       ********************/
-
-      const run = await prisma.datasetRuns.upsert({
-        where: {
-          datasetId_projectId_name: {
-            datasetId: datasetItem.datasetId,
-            name: runName,
-            projectId: auth.scope.projectId,
-          },
-        },
-        create: {
-          name: runName,
-          description: runDescription ?? undefined,
-          datasetId: datasetItem.datasetId,
-          metadata: metadata ?? undefined,
-          projectId: auth.scope.projectId,
-        },
-        update: {
-          metadata: metadata ?? undefined,
-          description: runDescription ?? undefined,
-        },
-      });
-
-      const runItem = await prisma.datasetRunItems.create({
-        data: {
-          datasetItemId,
-          traceId: finalTraceId,
-          observationId,
-          datasetRunId: run.id,
-          projectId: auth.scope.projectId,
-        },
-      });
-
-      /********************
-       * ASYNC RUN ITEM EVAL *
-       ********************/
-
-      await addDatasetRunItemsToEvalQueue({
+      return await createDatasetRunItemForApi({ body, auth, res });
+    },
+  }),
+  GET: createAuthedProjectAPIRoute({
+    name: "Get Dataset Run Items",
+    querySchema: GetDatasetRunItemsV1Query,
+    responseSchema: GetDatasetRunItemsV1Response,
+    deprecation: DATASET_RUN_ITEMS_DEPRECATION,
+    rateLimitResource: "datasets",
+    // Reads from the legacy dataset_run_items ClickHouse table, which is no
+    // longer populated in events_only mode; GET /api/public/experiment-items
+    // is the replacement.
+    rejectInEventsOnlyMode: true,
+    fn: async ({ query, auth }) => {
+      return await listDatasetRunItemsForApi({
+        datasetId: query.datasetId,
+        runName: query.runName,
         projectId: auth.scope.projectId,
-        datasetItemId,
-        traceId: finalTraceId,
-        observationId: observationId ?? undefined,
-      });
-
-      return transformDbDatasetRunItemToAPIDatasetRunItem({
-        ...runItem,
-        datasetRunName: run.name,
+        limit: query.limit,
+        page: query.page,
       });
     },
   }),

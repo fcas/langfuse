@@ -1,39 +1,325 @@
 import { z } from "zod";
-import { isClickhouseAdminEligible } from "@/src/server/utils/checkClickhouseAccess";
 import {
   createTRPCRouter,
   protectedProjectProcedure,
 } from "@/src/server/api/trpc";
-import { executeQuery } from "@/src/server/api/services/queryBuilder";
 import {
   filterInterface,
-  type groupByInterface,
   sqlInterface,
 } from "@/src/server/api/services/sqlInterface";
 import { createHistogramData } from "@/src/features/dashboard/lib/score-analytics-utils";
 import { TRPCError } from "@trpc/server";
 import {
-  getTotalTraces,
-  getTracesGroupedByName,
-  getObservationsCostGroupedByName,
   getScoreAggregate,
-  getObservationUsageByTime,
-  groupTracesByTime,
-  getDistinctModels,
-  getScoresAggregateOverTime,
-  getTracesGroupedByUsers,
-  getModelUsageByUser,
-  getModelLatenciesOverTime,
-  getObservationLatencies,
-  getTracesLatencies,
   getNumericScoreHistogram,
-  getNumericScoreTimeSeries,
-  getCategoricalScoreTimeSeries,
-  getObservationsStatusTimeSeries,
+  extractFromAndToTimestampsFromFilter,
+  logger,
+  getObservationCostByTypeByTime,
+  getObservationUsageByTypeByTime,
+  DashboardService,
+  DashboardDefinitionSchema,
 } from "@langfuse/shared/src/server";
-import { type DatabaseRow } from "@/src/server/api/services/queryBuilder";
-import { dashboardColumnDefinitions } from "@langfuse/shared";
-import { env } from "@/src/env.mjs";
+import { type DatabaseRow } from "@/src/server/api/services/sqlInterface";
+import { executeQuery } from "@langfuse/shared/query/server";
+import {
+  query as customQuery,
+  validateQuery,
+  viewVersions,
+  type QueryType,
+} from "@langfuse/shared/query";
+import { mapLegacyUiTableFilterToView } from "@/src/features/dashboard/lib/dashboardUiTableToViewMapping";
+import {
+  paginationZod,
+  orderBy,
+  StringNoHTML,
+  InvalidRequestError,
+  singleFilter,
+  LANGFUSE_HOME_DASHBOARD_ID,
+  type FilterState,
+} from "@langfuse/shared";
+import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+
+// Define the dashboard list input schema
+const ListDashboardsInput = z.object({
+  projectId: z.string(),
+  ...paginationZod,
+  // The Home-dashboard picker and clone detection fetch the whole list in one
+  // page, so allow a higher ceiling than the default table pagination.
+  limit: z.coerce.number().int().positive().lte(500).default(50),
+  orderBy: orderBy,
+});
+
+// Get dashboard by ID input schema
+const GetDashboardInput = z.object({
+  projectId: z.string(),
+  dashboardId: z.string(),
+});
+
+// Update dashboard definition input schema
+const UpdateDashboardDefinitionInput = z.object({
+  projectId: z.string(),
+  dashboardId: z.string(),
+  definition: DashboardDefinitionSchema,
+});
+
+// Update dashboard input schema
+const UpdateDashboardInput = z.object({
+  projectId: z.string(),
+  dashboardId: z.string(),
+  name: StringNoHTML.min(1, "Dashboard name is required"),
+  description: StringNoHTML,
+});
+
+// Create dashboard input schema
+const CreateDashboardInput = z.object({
+  projectId: z.string(),
+  name: StringNoHTML.min(1, "Dashboard name is required"),
+  description: StringNoHTML,
+});
+
+// Clone dashboard input schema
+const CloneDashboardInput = z.object({
+  projectId: z.string(),
+  dashboardId: z.string(),
+  // Optional definition override so an edit attempted on a read-only
+  // dashboard (e.g. a tile moved on the curated Home) carries into the clone.
+  definition: DashboardDefinitionSchema.optional(),
+  // Set the clone as the project's home dashboard in the same gesture.
+  setAsHome: z.boolean().optional(),
+});
+
+// Set home dashboard input schema
+const SetHomeDashboardInput = z.object({
+  projectId: z.string(),
+  // null resets to the Langfuse-curated default
+  dashboardId: z.string().min(1).nullable(),
+});
+
+// Update dashboard filters input schema
+const UpdateDashboardFiltersInput = z.object({
+  projectId: z.string(),
+  dashboardId: z.string(),
+  filters: z.array(singleFilter),
+});
+
+/**
+ * First free clone name: "ABC (Clone)", then "ABC (Clone 2)", "ABC (Clone 3)", …
+ */
+function nextCloneName(sourceName: string, existingNames: string[]): string {
+  const taken = new Set(existingNames);
+  const base = `${sourceName} (Clone)`;
+  if (!taken.has(base)) return base;
+  let n = 2;
+  while (taken.has(`${sourceName} (Clone ${n})`)) n++;
+  return `${sourceName} (Clone ${n})`;
+}
+
+// Map camelCase legacy column names (used by scoreHistogram component)
+// to view-native field names before passing through the general mapper.
+const LEGACY_CAMEL_CASE_MAP: Record<string, string> = {
+  scoreName: "name",
+  scoreSource: "source",
+  scoreDataType: "dataType",
+};
+
+/**
+ * Shared filter preparation for scores-numeric v2 queries.
+ * Extracts time boundaries, strips time filters, and maps legacy UI column
+ * names to view-native field names.
+ */
+function prepareScoresNumericV2Params(filter: FilterState) {
+  const [from, to] = extractFromAndToTimestampsFromFilter(filter);
+  // Fallback to 2000-01-01 instead of epoch 0 — ClickHouse DateTimeFilter
+  // passes new Date(value).getTime() as the parameter, and the value 0
+  // (epoch) is rejected by ClickHouse's DateTime64(3) parameter parser.
+  const fromIso = from?.value
+    ? new Date(from.value as Date).toISOString()
+    : new Date("2000-01-01T00:00:00.000Z").toISOString();
+  const toIso = to?.value
+    ? new Date(to.value as Date).toISOString()
+    : new Date().toISOString();
+  const nonTimeFilters = filter.filter(
+    (f) => f.column !== "scoreTimestamp" && f.column !== "startTime",
+  );
+  const normalizedFilters = nonTimeFilters.map((f) => {
+    const mapped = LEGACY_CAMEL_CASE_MAP[f.column];
+    return mapped ? { ...f, column: mapped } : f;
+  });
+
+  const mappedFilters = mapLegacyUiTableFilterToView(
+    "scores-numeric",
+    normalizedFilters,
+  );
+  return { fromIso, toIso, mappedFilters };
+}
+
+/**
+ * Converts ClickHouse histogram(N)(...) output to the { chartData, chartLabels }
+ * shape returned by createHistogramData (used by the NumericScoreHistogram component).
+ *
+ * ClickHouse histogram() returns an Array(Tuple(Float64, Float64, Float64))
+ * where each tuple is (lower_bound, upper_bound, count).
+ * The result column is named "histogram_value" by QueryBuilder
+ * (pattern: `${aggregation}_${alias}`).
+ */
+function clickhouseHistogramToChartData(
+  result: Array<Record<string, unknown>>,
+): {
+  chartData: Array<{ binLabel: string; count: number }>;
+  chartLabels: string[];
+} {
+  if (result.length > 0 && !("histogram_value" in result[0])) {
+    throw new Error(
+      `Expected histogram_value column in QueryBuilder result, got: ${Object.keys(result[0]).join(", ")}`,
+    );
+  }
+  const histogramBins = result[0]?.histogram_value as
+    | Array<[number, number, number]>
+    | undefined;
+  if (!histogramBins?.length) return { chartData: [], chartLabels: [] };
+
+  const round = (v: number) => parseFloat(v.toFixed(2));
+  return {
+    chartLabels: ["count"],
+    chartData: histogramBins.map(([lower, upper, count]) => ({
+      binLabel: `[${round(lower)}, ${round(upper)}]`,
+      count: Math.round(count),
+    })),
+  };
+}
+
+async function getScoreAggregateV2({
+  projectId,
+  filter,
+}: {
+  projectId: string;
+  filter: FilterState;
+}): Promise<DatabaseRow[]> {
+  // prepareScoresNumericV2Params also applies LEGACY_CAMEL_CASE_MAP for
+  // scoreHistogram callers. For score-aggregate calls, the only camelCase
+  // column is "scoreTimestamp" which is stripped as a time filter before
+  // LEGACY_CAMEL_CASE_MAP runs, making the normalization step a no-op here.
+  const { fromIso, toIso, mappedFilters } =
+    prepareScoresNumericV2Params(filter);
+
+  // Non-time filters in their original form — used for categorical query
+  // filter mapping and value filter detection below.
+  const nonTimeFilters = filter.filter(
+    (f) => f.column !== "scoreTimestamp" && f.column !== "startTime",
+  );
+
+  const baseQuery = {
+    dimensions: [{ field: "name" }, { field: "source" }, { field: "dataType" }],
+    timeDimension: null,
+    fromTimestamp: fromIso,
+    toTimestamp: toIso,
+    orderBy: [{ field: "sum_count", direction: "desc" as const }],
+  };
+
+  const numericQuery: QueryType = {
+    ...baseQuery,
+    view: "scores-numeric",
+    metrics: [
+      { measure: "count", aggregation: "sum" },
+      { measure: "value", aggregation: "avg" },
+    ],
+    filters: mappedFilters,
+  };
+
+  // The scores-categorical view has no "value" dimension, so we handle value
+  // filters manually: categorical scores always have value=0 in ClickHouse, so
+  // value=0 should include all categoricals, while any other value filter
+  // (e.g. value=1) should exclude them. This matches v1 behavior where numeric
+  // and categorical scores are queried together in a single SQL statement.
+  const valueFilter = nonTimeFilters.find((f) => f.column === "value");
+  const skipCategorical =
+    valueFilter && "value" in valueFilter && valueFilter.value !== 0;
+  const categoricalFilters = nonTimeFilters.filter((f) => f.column !== "value");
+
+  const categoricalQuery: QueryType = {
+    ...baseQuery,
+    view: "scores-categorical",
+    metrics: [{ measure: "count", aggregation: "sum" }],
+    filters: mapLegacyUiTableFilterToView(
+      "scores-categorical",
+      categoricalFilters,
+    ),
+  };
+
+  const [numericResults, categoricalResults] = await Promise.all([
+    executeQuery(projectId, numericQuery, "v2"),
+    skipCategorical
+      ? Promise.resolve([])
+      : executeQuery(projectId, categoricalQuery, "v2"),
+  ]);
+
+  const merged = [
+    ...numericResults.map((r) => ({
+      scoreName: String(r.name),
+      countScoreId: Number(r.sum_count ?? 0),
+      avgValue: Number(r.avg_value ?? 0),
+      scoreSource: String(r.source),
+      scoreDataType: String(r.dataType),
+    })),
+    ...categoricalResults.map((r) => ({
+      scoreName: String(r.name),
+      countScoreId: Number(r.sum_count ?? 0),
+      avgValue: 0,
+      scoreSource: String(r.source),
+      scoreDataType: String(r.dataType),
+    })),
+  ].sort((a, b) => b.countScoreId - a.countScoreId);
+
+  return merged as DatabaseRow[];
+}
+
+async function getObservationsByTypeV2(params: {
+  projectId: string;
+  filter: FilterState;
+  dimensionField: "costType" | "usageType";
+  metricMeasure: "costByType" | "usageByType";
+}): Promise<DatabaseRow[]> {
+  const { projectId, filter, dimensionField, metricMeasure } = params;
+
+  const [from, to] = extractFromAndToTimestampsFromFilter(filter);
+  if (!from?.value || !to?.value) {
+    throw new TRPCError({
+      code: "BAD_REQUEST",
+      message: "Time filter required",
+    });
+  }
+
+  // Filter normalisation for the executeQuery (v2) path:
+  //
+  const nonDatetimeFilters = filter.filter((f) => f.type !== "datetime");
+  // mapLegacyUiTableFilterToView normalizes legacy dashboard filters whether
+  // they arrive as display labels, uiTableIds, or explicit aliases.
+  const viewFilters = mapLegacyUiTableFilterToView(
+    "observations",
+    nonDatetimeFilters,
+  );
+
+  const q: QueryType = {
+    view: "observations",
+    dimensions: [{ field: dimensionField }],
+    metrics: [{ measure: metricMeasure, aggregation: "sum" }],
+    filters: viewFilters,
+    timeDimension: { granularity: "auto" },
+    fromTimestamp: new Date(from.value as Date).toISOString(),
+    toTimestamp: new Date(to.value as Date).toISOString(),
+    orderBy: null,
+  };
+
+  const rows = await executeQuery(projectId, q, "v2", true);
+
+  // Transform flat rows to { intervalStart, key, sum } expected by the component.
+  const sumField = `sum_${metricMeasure}`;
+  return rows.map((row) => ({
+    intervalStart: new Date(row["time_dimension"] as string),
+    key: row[dimensionField] as string,
+    sum: Number(row[sumField] ?? 0),
+  })) as DatabaseRow[];
+}
 
 export const dashboardRouter = createTRPCRouter({
   chart: protectedProjectProcedure
@@ -41,308 +327,421 @@ export const dashboardRouter = createTRPCRouter({
       sqlInterface.extend({
         projectId: z.string(),
         filter: filterInterface.optional(),
-        queryClickhouse: z.boolean().default(false),
+        version: viewVersions.optional().default("v1"),
         queryName: z
           .enum([
-            "traces-total",
-            "traces-grouped-by-name",
-            "observations-model-cost",
+            // Current score table is weird and does not fit into new model. Keep around as is until we decide what to do with it.
             "score-aggregate",
-            "traces-timeseries",
-            "observations-usage-timeseries",
-            "distinct-models",
-            "scores-aggregate-timeseries",
-            "observations-usage-by-users",
-            "traces-grouped-by-user",
-            "observation-latencies-aggregated",
-            "traces-latencies-aggregated",
-            "model-latencies-over-time",
-            "numeric-score-time-series",
-            "categorical-score-chart",
-            "observations-status-timeseries",
+            "observations-usage-by-type-timeseries",
+            "observations-cost-by-type-timeseries",
           ])
           .nullish(),
       }),
     )
-    .query(async ({ input, ctx }) => {
-      if (
-        input.queryClickhouse &&
-        !isClickhouseAdminEligible(ctx.session.user)
-      ) {
-        throw new TRPCError({
-          code: "UNAUTHORIZED",
-          message: "Not eligible to query clickhouse",
-        });
+    .query(async ({ input }) => {
+      const [from, to] = extractFromAndToTimestampsFromFilter(input.filter);
+
+      if (from.value && to.value && from.value > to.value) {
+        logger.error(
+          `from > to, returning empty result: from=${from}, to=${to}`,
+        );
+        return [];
       }
 
-      if (
-        input.queryClickhouse ||
-        env.LANGFUSE_READ_DASHBOARDS_FROM_CLICKHOUSE === "true"
-      ) {
-        switch (input.queryName) {
-          case "traces-total":
-            const count = await getTotalTraces(
-              input.projectId,
-              input.filter ?? [],
-            );
-            return count as DatabaseRow[];
-          case "traces-grouped-by-name":
-            return (
-              await getTracesGroupedByName(
-                input.projectId,
-                dashboardColumnDefinitions,
-                input.filter,
-              )
-            ).map(
-              (row) =>
-                ({
-                  traceName: row.name,
-                  countTraceId: row.count,
-                }) as DatabaseRow,
-            );
-          case "observations-model-cost":
-            const cost = await getObservationsCostGroupedByName(
-              input.projectId,
-              input.filter ?? [],
-            );
-
-            return cost.map((row) => ({
-              model: row.name,
-              sumCalculatedTotalCost: row.sum_cost_details,
-              sumTotalTokens: row.sum_usage_details,
-            })) as DatabaseRow[];
-          case "score-aggregate":
-            const scores = await getScoreAggregate(
-              input.projectId,
-              input.filter ?? [],
-            );
-
-            return scores.map((row) => ({
-              scoreName: row.name,
-              scoreSource: row.source,
-              scoreDataType: row.data_type,
-              avgValue: row.avg_value,
-              countScoreId: Number(row.count),
-            })) as DatabaseRow[];
-
-          case "traces-timeseries":
-            const dateTrunc = extractTimeSeries(input.groupBy);
-            if (!dateTrunc) {
-              return [];
-            }
-            const rows = await groupTracesByTime(
-              input.projectId,
-              input.filter ?? [],
-              dateTrunc,
-            );
-
-            return rows as DatabaseRow[];
-          case "observations-usage-timeseries":
-            const dateTruncObs = extractTimeSeries(input.groupBy);
-            if (!dateTruncObs) {
-              return [];
-            }
-            const rowsObs = await getObservationUsageByTime(
-              input.projectId,
-              input.filter ?? [],
-              dateTruncObs,
-            );
-
-            return rowsObs.map((row) => ({
-              startTime: row.start_time,
-              units: row.units,
-              cost: row.cost,
-              model: row.provided_model_name,
-            })) as DatabaseRow[];
-
-          case "distinct-models":
-            const models = await getDistinctModels(
-              input.projectId,
-              input.filter ?? [],
-            );
-            return models as DatabaseRow[];
-
-          case "scores-aggregate-timeseries":
-            const dateTruncScores = extractTimeSeries(input.groupBy);
-            if (!dateTruncScores) {
-              return [];
-            }
-            const aggregatedScores = await getScoresAggregateOverTime(
-              input.projectId,
-              input.filter ?? [],
-              dateTruncScores,
-            );
-
-            return aggregatedScores as DatabaseRow[];
-
-          case "observations-usage-by-users":
-            const rowsUsers = await getModelUsageByUser(
-              input.projectId,
-              input.filter ?? [],
-            );
-
-            return rowsUsers.map((row) => ({
-              sumTotalTokens: row.sumUsageDetails,
-              sumCalculatedTotalCost: row.sumCostDetails,
-              user: row.userId,
-            })) as DatabaseRow[];
-
-          case "traces-grouped-by-user":
-            const traces = await getTracesGroupedByUsers(
-              input.projectId,
-              input.filter ?? [],
-              undefined,
-              1000,
-              0,
-              dashboardColumnDefinitions,
-            );
-
-            return traces.map((row) => ({
-              user: row.user,
-              countTraceId: Number(row.count),
-            })) as DatabaseRow[];
-          case "observation-latencies-aggregated":
-            const latencies = await getObservationLatencies(
-              input.projectId,
-              input.filter ?? [],
-            );
-
-            return latencies.map((row) => ({
-              name: row.name,
-              percentile50Duration: row.p50,
-              percentile90Duration: row.p90,
-              percentile95Duration: row.p95,
-              percentile99Duration: row.p99,
-            })) as DatabaseRow[];
-          case "model-latencies-over-time":
-            const dateTruncModels = extractTimeSeries(input.groupBy);
-            if (!dateTruncModels) {
-              return [];
-            }
-            const modelLatencies = await getModelLatenciesOverTime(
-              input.projectId,
-              input.filter ?? [],
-              dateTruncModels,
-            );
-
-            return modelLatencies.map((row) => ({
-              model: row.model,
-              startTime: row.start_time,
-              percentile50Duration: row.p50,
-              percentile75Duration: row.p75,
-              percentile90Duration: row.p90,
-              percentile95Duration: row.p95,
-              percentile99Duration: row.p99,
-            })) as DatabaseRow[];
-          case "traces-latencies-aggregated":
-            const traceLatencies = await getTracesLatencies(
-              input.projectId,
-              input.filter ?? [],
-            );
-
-            return traceLatencies.map((row) => ({
-              traceName: row.name,
-              percentile50Duration: row.p50,
-              percentile90Duration: row.p90,
-              percentile95Duration: row.p95,
-              percentile99Duration: row.p99,
-            })) as DatabaseRow[];
-          case "numeric-score-time-series":
-            const dateTruncNumericScoreTimeSeries = extractTimeSeries(
-              input.groupBy,
-            );
-            if (!dateTruncNumericScoreTimeSeries) {
-              return [];
-            }
-            const numericScoreTimeSeries = await getNumericScoreTimeSeries(
-              input.projectId,
-              input.filter ?? [],
-              dateTruncNumericScoreTimeSeries,
-            );
-            return numericScoreTimeSeries.map((row) => ({
-              scoreTimestamp: row.score_timestamp,
-              scoreName: row.score_name,
-              avgValue: row.avg_value,
-            })) as DatabaseRow[];
-          case "categorical-score-chart":
-            const dateTruncCategoricalScoreTimeSeries = extractTimeSeries(
-              input.groupBy,
-            );
-            const categoricalScoreTimeSeries =
-              await getCategoricalScoreTimeSeries(
-                input.projectId,
-                input.filter ?? [],
-                dateTruncCategoricalScoreTimeSeries,
-              );
-            return categoricalScoreTimeSeries.map((row) => ({
-              ...(row.score_timestamp
-                ? { scoreTimestamp: row.score_timestamp }
-                : {}),
-              scoreName: row.score_name || null,
-              scoreDataType: row.score_data_type || null,
-              scoreSource: row.score_source || null,
-              stringValue: row.score_value || null,
-              countStringValue: Number(row.count) || 0,
-            })) as DatabaseRow[];
-          case "observations-status-timeseries":
-            const timeSeriesGroupBy = extractTimeSeries(input.groupBy);
-
-            return (await getObservationsStatusTimeSeries(
-              input.projectId,
-              input.filter ?? [],
-              timeSeriesGroupBy,
-            )) as DatabaseRow[];
-
-          default:
-            throw new TRPCError({
-              code: "NOT_FOUND",
-              message: "Query not found",
+      switch (input.queryName) {
+        case "score-aggregate":
+          if (input.version === "v2") {
+            return getScoreAggregateV2({
+              projectId: input.projectId,
+              filter: input.filter ?? [],
             });
-        }
+          }
+          const scores = await getScoreAggregate(
+            input.projectId,
+            input.filter ?? [],
+          );
+          return scores.map((row) => ({
+            scoreName: row.name,
+            scoreSource: row.source,
+            scoreDataType: row.data_type,
+            avgValue: row.avg_value,
+            countScoreId: Number(row.count),
+          })) as DatabaseRow[];
+        case "observations-usage-by-type-timeseries":
+          if (input.version === "v2") {
+            return getObservationsByTypeV2({
+              projectId: input.projectId,
+              filter: input.filter ?? [],
+              dimensionField: "usageType",
+              metricMeasure: "usageByType",
+            });
+          }
+          const rowsObsType = await getObservationUsageByTypeByTime(
+            input.projectId,
+            input.filter ?? [],
+          );
+          return rowsObsType as DatabaseRow[];
+        case "observations-cost-by-type-timeseries":
+          if (input.version === "v2") {
+            return getObservationsByTypeV2({
+              projectId: input.projectId,
+              filter: input.filter ?? [],
+              dimensionField: "costType",
+              metricMeasure: "costByType",
+            });
+          }
+          const rowsObsCostByType = await getObservationCostByTypeByTime(
+            input.projectId,
+            input.filter ?? [],
+          );
+          return rowsObsCostByType as DatabaseRow[];
+        default:
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "Query not found",
+          });
       }
-      return await executeQuery(ctx.prisma, input.projectId, input);
     }),
   scoreHistogram: protectedProjectProcedure
     .input(
       sqlInterface.extend({
         projectId: z.string(),
         filter: filterInterface.optional(),
-        queryClickhouse: z.boolean().default(false),
+        version: viewVersions.optional().default("v1"),
       }),
     )
-    .query(async ({ input, ctx }) => {
-      if (
-        input.queryClickhouse &&
-        !isClickhouseAdminEligible(ctx.session.user)
-      ) {
+    .query(async ({ input }) => {
+      if (input.version === "v2") {
+        // v2: ClickHouse histogram() aggregates all matching rows server-side.
+        // `input.limit` is ignored — no row-level cap is needed.
+        const { fromIso, toIso, mappedFilters } = prepareScoresNumericV2Params(
+          input.filter ?? [],
+        );
+        const histogramQuery: QueryType = {
+          view: "scores-numeric",
+          dimensions: [],
+          metrics: [{ measure: "value", aggregation: "histogram" }],
+          filters: mappedFilters,
+          fromTimestamp: fromIso,
+          toTimestamp: toIso,
+          timeDimension: null,
+          orderBy: null,
+          chartConfig: { type: "HISTOGRAM", bins: 10 },
+        };
+        const result = await executeQuery(
+          input.projectId,
+          histogramQuery,
+          "v2",
+        );
+        return clickhouseHistogramToChartData(result);
+      }
+
+      const data = await getNumericScoreHistogram(
+        input.projectId,
+        input.filter ?? [],
+        input.limit ?? 10000,
+      );
+      return createHistogramData(data);
+    }),
+  executeQuery: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        query: customQuery,
+        version: viewVersions.optional().default("v1"),
+      }),
+    )
+    .query(async ({ input }) => {
+      try {
+        const validation = validateQuery(input.query, input.version);
+        if (!validation.valid) {
+          throw new InvalidRequestError(validation.reason);
+        }
+
+        return executeQuery(
+          input.projectId,
+          input.query,
+          input.version,
+          input.version === "v2",
+        );
+      } catch (error) {
+        if (error instanceof InvalidRequestError) {
+          logger.warn("Bad request in query execution", error, {
+            projectId: input.projectId,
+            query: input.query,
+          });
+          throw error;
+        }
+        logger.error("Error executing query", error, {
+          projectId: input.projectId,
+          query: input.query,
+        });
+        throw error;
+      }
+    }),
+
+  allDashboards: protectedProjectProcedure
+    .input(ListDashboardsInput)
+    .query(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:read",
+      });
+
+      const result = await DashboardService.listDashboards({
+        projectId: input.projectId,
+        limit: input.limit,
+        page: input.page,
+        orderBy: input.orderBy,
+      });
+
+      return result;
+    }),
+
+  getDashboard: protectedProjectProcedure
+    .input(GetDashboardInput)
+    .query(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:read",
+      });
+
+      const dashboard = await DashboardService.getDashboard(
+        input.dashboardId,
+        input.projectId,
+      );
+
+      if (!dashboard) {
         throw new TRPCError({
-          code: "UNAUTHORIZED",
-          message: "Not eligible to query clickhouse",
+          code: "NOT_FOUND",
+          message: "Dashboard not found",
         });
       }
 
-      if (
-        input.queryClickhouse ||
-        env.LANGFUSE_READ_DASHBOARDS_FROM_CLICKHOUSE === "true"
-      ) {
-        const data = await getNumericScoreHistogram(
-          input.projectId,
-          input.filter ?? [],
-          input.limit ?? 10000,
-        );
-        return createHistogramData(data);
+      return dashboard;
+    }),
+
+  createDashboard: protectedProjectProcedure
+    .input(CreateDashboardInput)
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      const dashboard = await DashboardService.createDashboard(
+        input.projectId,
+        input.name,
+        input.description,
+        ctx.session.user.id,
+      );
+
+      return dashboard;
+    }),
+
+  updateDashboardDefinition: protectedProjectProcedure
+    .input(UpdateDashboardDefinitionInput)
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      const dashboard = await DashboardService.updateDashboardDefinition(
+        input.dashboardId,
+        input.projectId,
+        input.definition,
+        ctx.session.user.id,
+      );
+
+      return dashboard;
+    }),
+
+  updateDashboardMetadata: protectedProjectProcedure
+    .input(UpdateDashboardInput)
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      const dashboard = await DashboardService.updateDashboard(
+        input.dashboardId,
+        input.projectId,
+        input.name,
+        input.description,
+        ctx.session.user.id,
+      );
+
+      return dashboard;
+    }),
+
+  cloneDashboard: protectedProjectProcedure
+    .input(CloneDashboardInput)
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      // Get the source dashboard
+      const sourceDashboard = await DashboardService.getDashboard(
+        input.dashboardId,
+        input.projectId,
+      );
+
+      if (!sourceDashboard) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Source dashboard not found",
+        });
       }
 
-      const data = await executeQuery(ctx.prisma, input.projectId, input);
-      return createHistogramData(data);
+      // Create a new dashboard with the same data but a numbered clone name
+      const existingClones = await ctx.prisma.dashboard.findMany({
+        where: {
+          projectId: input.projectId,
+          name: { startsWith: `${sourceDashboard.name} (Clone` },
+        },
+        select: { name: true },
+      });
+
+      const clonedDashboard = await DashboardService.createDashboard(
+        input.projectId,
+        nextCloneName(
+          sourceDashboard.name,
+          existingClones.map((d) => d.name),
+        ),
+        sourceDashboard.description,
+        ctx.session.user.id,
+        input.definition ?? sourceDashboard.definition,
+      );
+
+      if (input.setAsHome) {
+        await ctx.prisma.project.update({
+          where: { id: input.projectId },
+          data: { homeDashboardId: clonedDashboard.id },
+        });
+      }
+
+      return clonedDashboard;
+    }),
+
+  getHomeDashboard: protectedProjectProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:read",
+      });
+
+      const project = await ctx.prisma.project.findUnique({
+        where: { id: input.projectId },
+        select: { homeDashboardId: true },
+      });
+
+      // Resolve the pointer; a missing/foreign target silently falls back to
+      // the Langfuse-curated default (like an unset pointer).
+      const pointedDashboard = project?.homeDashboardId
+        ? await DashboardService.getDashboard(
+            project.homeDashboardId,
+            input.projectId,
+          )
+        : null;
+
+      const dashboard =
+        pointedDashboard ??
+        (await DashboardService.getDashboard(
+          LANGFUSE_HOME_DASHBOARD_ID,
+          input.projectId,
+        ));
+
+      return {
+        // null only when the curated row is also absent — the client then
+        // renders from the shared constant.
+        dashboard,
+        homeDashboardId: pointedDashboard
+          ? (project?.homeDashboardId ?? null)
+          : null,
+      };
+    }),
+
+  setHomeDashboard: protectedProjectProcedure
+    .input(SetHomeDashboardInput)
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      if (input.dashboardId) {
+        const dashboard = await DashboardService.getDashboard(
+          input.dashboardId,
+          input.projectId,
+        );
+        if (!dashboard) {
+          throw new TRPCError({
+            code: "NOT_FOUND",
+            message: "Dashboard not found",
+          });
+        }
+      }
+
+      await ctx.prisma.project.update({
+        where: { id: input.projectId },
+        data: { homeDashboardId: input.dashboardId },
+      });
+
+      return { success: true };
+    }),
+
+  updateDashboardFilters: protectedProjectProcedure
+    .input(UpdateDashboardFiltersInput)
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      const dashboard = await DashboardService.updateDashboardFilters(
+        input.dashboardId,
+        input.projectId,
+        input.filters,
+        ctx.session.user.id,
+      );
+
+      return dashboard;
+    }),
+
+  // Delete dashboard input schema
+  delete: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        dashboardId: z.string(),
+      }),
+    )
+    .mutation(async ({ ctx, input }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "dashboards:CUD",
+      });
+
+      await DashboardService.deleteDashboard(
+        input.dashboardId,
+        input.projectId,
+      );
+
+      return { success: true };
     }),
 });
-
-const extractTimeSeries = (groupBy?: z.infer<typeof groupByInterface>) => {
-  const temporal = groupBy?.find((group) => {
-    if (group.type === "datetime") {
-      return group;
-    }
-  });
-  return temporal?.type === "datetime" ? temporal.temporalUnit : undefined;
-};

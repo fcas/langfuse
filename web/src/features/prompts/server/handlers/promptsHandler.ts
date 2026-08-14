@@ -1,21 +1,18 @@
 import { type NextApiRequest, type NextApiResponse } from "next";
 
-import { createPrompt } from "@/src/features/prompts/server/actions/createPrompt";
-import { getPromptsMeta } from "@/src/features/prompts/server/actions/getPromptsMeta";
 import {
-  CreatePromptSchema,
-  GetPromptsMetaSchema,
-} from "@/src/features/prompts/server/utils/validation";
+  createPromptForApi,
+  listPromptsForApi,
+} from "@/src/features/prompts/server/prompt-api-service";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { prisma } from "@langfuse/shared/src/db";
-import { redis } from "@langfuse/shared/src/server";
 import { authorizePromptRequestOrThrow } from "../utils/authorizePromptRequest";
 import { RateLimitService } from "@/src/features/public-api/server/RateLimitService";
+import { CreatePromptSchema, GetPromptsMetaSchema } from "@langfuse/shared";
 
 const getPromptsHandler = async (req: NextApiRequest, res: NextApiResponse) => {
   const authCheck = await authorizePromptRequestOrThrow(req);
 
-  const rateLimitCheck = await new RateLimitService(redis).rateLimitRequest(
+  const rateLimitCheck = await RateLimitService.getInstance().rateLimitRequest(
     authCheck.scope,
     "prompts",
   );
@@ -25,7 +22,7 @@ const getPromptsHandler = async (req: NextApiRequest, res: NextApiResponse) => {
   }
 
   const input = GetPromptsMetaSchema.parse(req.query);
-  const promptsMetadata = await getPromptsMeta({
+  const promptsMetadata = await listPromptsForApi({
     ...input,
     projectId: authCheck.scope.projectId,
   });
@@ -39,7 +36,7 @@ const postPromptsHandler = async (
 ) => {
   const authCheck = await authorizePromptRequestOrThrow(req);
 
-  const rateLimitCheck = await new RateLimitService(redis).rateLimitRequest(
+  const rateLimitCheck = await RateLimitService.getInstance().rateLimitRequest(
     authCheck.scope,
     "prompts",
   );
@@ -49,12 +46,9 @@ const postPromptsHandler = async (
   }
 
   const input = CreatePromptSchema.parse(req.body);
-  const createdPrompt = await createPrompt({
-    ...input,
-    config: input.config ?? {},
-    projectId: authCheck.scope.projectId,
-    createdBy: "API",
-    prisma: prisma,
+  const createdPrompt = await createPromptForApi({
+    context: authCheck.scope,
+    input,
   });
 
   return res.status(201).json(createdPrompt);

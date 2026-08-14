@@ -1,5 +1,5 @@
 import { Transform, type TransformCallback } from "stream";
-import { stringify } from "./stringify";
+import { stringify } from "../../../utils/stringify";
 
 export function transformStreamToJson(): Transform {
   let isFirstElement = true;
@@ -10,7 +10,7 @@ export function transformStreamToJson(): Transform {
     transform(
       row: any,
       encoding: BufferEncoding,
-      callback: TransformCallback
+      callback: TransformCallback,
     ): void {
       if (isFirstElement) {
         this.push("["); // Push the opening bracket for the first element

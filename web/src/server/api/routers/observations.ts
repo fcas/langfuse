@@ -2,10 +2,10 @@ import {
   createTRPCRouter,
   protectedGetTraceProcedure,
 } from "@/src/server/api/trpc";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
+import { LangfuseNotFoundError, parseIO } from "@langfuse/shared";
 import { getObservationById } from "@langfuse/shared/src/server";
-import { TRPCError } from "@trpc/server";
 import { z } from "zod";
+import { toDomainWithStringifiedMetadata } from "@/src/utils/clientSideDomainTypes";
 
 export const observationsRouter = createTRPCRouter({
   byId: protectedGetTraceProcedure
@@ -15,41 +15,33 @@ export const observationsRouter = createTRPCRouter({
         traceId: z.string(), // required for protectedGetTraceProcedure
         projectId: z.string(), // required for protectedGetTraceProcedure
         startTime: z.date().nullish(),
-        queryClickhouse: z.boolean().default(false),
+        verbosity: z.enum(["compact", "truncated", "full"]).default("full"),
       }),
     )
-    .query(async ({ input, ctx }) => {
-      return measureAndReturnApi({
-        input,
-        operation: "observations.byId",
-        user: ctx.session.user,
-        pgExecution: async () => {
-          return await ctx.prisma.observation.findFirstOrThrow({
-            where: {
-              id: input.observationId,
-              traceId: input.traceId,
-              projectId: input.projectId,
-            },
-          });
+    .query(async ({ input }) => {
+      const queryOpts = {
+        id: input.observationId,
+        projectId: input.projectId,
+        fetchWithInputOutput: true,
+        traceId: input.traceId,
+        startTime: input.startTime ?? undefined,
+        renderingProps: {
+          truncated: input.verbosity === "truncated",
+          shouldJsonParse: false,
         },
-        clickhouseExecution: async () => {
-          const obs = await getObservationById(
-            input.observationId,
-            input.projectId,
-            true,
-            input.startTime ?? undefined,
-          );
-          if (!obs) {
-            throw new TRPCError({
-              code: "NOT_FOUND",
-              message: "Observation not found within authorized project",
-            });
-          }
-          return {
-            ...obs,
-            internalModel: obs?.internalModelId,
-          };
-        },
-      });
+      };
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
+      const obs = await getObservationById(queryOpts);
+      if (!obs) {
+        throw new LangfuseNotFoundError(
+          "Observation not found within authorized project",
+        );
+      }
+      return {
+        ...toDomainWithStringifiedMetadata(obs),
+        input: parseIO(obs.input, input.verbosity) as string,
+        output: parseIO(obs.output, input.verbosity) as string,
+        internalModel: obs?.internalModelId,
+      };
     }),
 });

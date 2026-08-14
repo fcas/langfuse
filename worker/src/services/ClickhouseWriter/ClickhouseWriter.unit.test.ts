@@ -6,20 +6,20 @@ import { env } from "../../env";
 import { logger } from "@langfuse/shared/src/server";
 import { ClickhouseWriter, TableName } from "../ClickhouseWriter";
 
-// Mock recordHistogram, recordCount, recordGauge
+// Mock recordHistogram, recordDistribution, recordCount, recordGauge
 vi.mock("@langfuse/shared/src/server", async (importOriginal) => {
   const original = (await importOriginal()) as {};
   return {
     ...original,
-    defaultClickhouseClient: {
-      insert: vi.fn(),
-    },
     recordHistogram: vi.fn(),
+    recordDistribution: vi.fn(),
+    recordIncrement: vi.fn(),
     recordCount: vi.fn(),
     recordGauge: vi.fn(),
     logger: {
       info: vi.fn(),
       debug: vi.fn(),
+      warn: vi.fn(),
       error: vi.fn(),
     },
   };
@@ -38,21 +38,29 @@ vi.mock("../../env", async (importOriginal) => {
 });
 
 describe("ClickhouseWriter", () => {
+  let clickhouseClientMock: {
+    insert: ReturnType<typeof vi.fn>;
+  };
   let writer: ClickhouseWriter;
 
   beforeEach(() => {
+    vi.clearAllMocks();
+    clickhouseClientMock = {
+      insert: vi.fn(),
+    };
     vi.useFakeTimers();
-    writer = ClickhouseWriter.getInstance();
+    writer = ClickhouseWriter.getInstance(clickhouseClientMock);
   });
 
   afterEach(async () => {
-    vi.restoreAllMocks();
     vi.useRealTimers();
 
     // Reset singleton instance
     await writer.shutdown();
 
     ClickhouseWriter.instance = null;
+    vi.restoreAllMocks();
+    vi.clearAllMocks();
   });
 
   it("should be a singleton", () => {
@@ -84,7 +92,7 @@ describe("ClickhouseWriter", () => {
 
   it("should flush when queue reaches batch size", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
 
     for (let i = 0; i < writer.batchSize; i++) {
@@ -99,7 +107,7 @@ describe("ClickhouseWriter", () => {
 
   it("should flush at regular intervals", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
     writer.addToQueue(TableName.Traces, { id: "1", name: "test" });
 
@@ -108,9 +116,37 @@ describe("ClickhouseWriter", () => {
     expect(mockInsert).toHaveBeenCalledTimes(1);
   });
 
+  it("should mark writer insert log comments as multi-project", async () => {
+    const mockInsert = vi
+      .spyOn(clickhouseClientMock, "insert")
+      .mockResolvedValue();
+
+    writer.addToQueue(TableName.Traces, {
+      id: "1",
+      name: "test",
+      project_id: "project-1",
+    } as any);
+    writer.addToQueue(TableName.Traces, {
+      id: "2",
+      name: "test",
+      project_id: "project-1",
+    } as any);
+
+    await vi.advanceTimersByTimeAsync(writer.writeInterval);
+
+    const logComment = JSON.parse(
+      mockInsert.mock.calls[0][0].clickhouse_settings.log_comment,
+    );
+    expect(logComment).toMatchObject({
+      surface: "worker",
+      route: "clickhouse-writer",
+      projectId: "MULTI_PROJECT",
+    });
+  });
+
   it("should handle errors and retry", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockRejectedValueOnce(new Error("DB Error"))
       .mockResolvedValueOnce();
 
@@ -130,7 +166,7 @@ describe("ClickhouseWriter", () => {
 
   it("should drop records after max attempts", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockRejectedValue(new Error("DB Error"));
 
     writer.addToQueue(TableName.Traces, { id: "1", name: "test" });
@@ -142,16 +178,44 @@ describe("ClickhouseWriter", () => {
     await vi.advanceTimersByTimeAsync(writer.writeInterval);
 
     expect(mockInsert).toHaveBeenCalledTimes(writer.maxAttempts);
-    expect(logger.error).toHaveBeenCalledWith(
-      expect.stringContaining("Max attempts reached"),
-    );
+    expect(
+      logger.error.mock.calls.some((call) =>
+        call[0].includes("Max attempts reached"),
+      ),
+    ).toBe(true);
     expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+    expect(serverExports.recordIncrement).toHaveBeenCalledWith(
+      "langfuse.queue.clickhouse_writer.rows_dropped",
+      1,
+      { entity_type: TableName.Traces },
+    );
+  });
+
+  it("should retry client request timeouts within the same flush", async () => {
+    const mockInsert = vi
+      .spyOn(clickhouseClientMock, "insert")
+      .mockRejectedValueOnce(new Error("Timeout error."))
+      .mockResolvedValueOnce();
+
+    writer.addToQueue(TableName.Traces, { id: "1", name: "test" });
+
+    await vi.advanceTimersByTimeAsync(writer.writeInterval);
+    // let the backOff retry delay elapse
+    await vi.advanceTimersByTimeAsync(200);
+
+    expect(mockInsert).toHaveBeenCalledTimes(2);
+    expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+    expect(serverExports.recordIncrement).not.toHaveBeenCalledWith(
+      "langfuse.queue.clickhouse_writer.rows_dropped",
+      expect.anything(),
+      expect.anything(),
+    );
   });
 
   it("should shutdown gracefully", async () => {
     writer.addToQueue(TableName.Traces, { id: "1", name: "test" });
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
 
     await writer.shutdown();
@@ -165,7 +229,7 @@ describe("ClickhouseWriter", () => {
 
   it("should handle multiple table types", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
 
     writer.addToQueue(TableName.Traces, { id: "1", name: "trace" });
@@ -182,7 +246,7 @@ describe("ClickhouseWriter", () => {
 
   it("should not flush when isIntervalFlushInProgress is true", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
     writer["isIntervalFlushInProgress"] = true;
     writer.addToQueue(TableName.Traces, { id: "1", name: "test" });
@@ -205,7 +269,7 @@ describe("ClickhouseWriter", () => {
 
   it("should flush all queues when flushAll is called directly", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
     writer.addToQueue(TableName.Traces, { id: "1", name: "trace" });
     writer.addToQueue(TableName.Scores, { id: "2", name: "score" });
@@ -219,7 +283,7 @@ describe("ClickhouseWriter", () => {
 
   it("should handle adding items to queue while flush is in progress", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockImplementation(() => {
         writer.addToQueue(TableName.Traces, { id: "2", name: "test2" });
         return Promise.resolve();
@@ -236,7 +300,7 @@ describe("ClickhouseWriter", () => {
 
   it("should handle concurrent writes during high load", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
     const concurrentWrites = 1000;
 
@@ -256,31 +320,52 @@ describe("ClickhouseWriter", () => {
   });
 
   it("should report wait time and processing time metrics correctly", async () => {
-    const metricsDistributionSpy = vi.spyOn(serverExports, "recordHistogram");
+    const histogramSpy = vi.spyOn(serverExports, "recordHistogram");
+    const distributionSpy = vi.spyOn(serverExports, "recordDistribution");
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
 
     writer.addToQueue(TableName.Traces, { id: "1", name: "test" });
 
     await vi.advanceTimersByTimeAsync(writer.writeInterval);
 
-    expect(metricsDistributionSpy).toHaveBeenCalledWith(
+    expect(histogramSpy).toHaveBeenCalledWith(
       "langfuse.queue.clickhouse_writer.wait_time",
       expect.any(Number),
       { unit: "milliseconds" },
     );
 
-    expect(metricsDistributionSpy).toHaveBeenCalledWith(
+    expect(histogramSpy).toHaveBeenCalledWith(
       "langfuse.queue.clickhouse_writer.processing_time",
       expect.any(Number),
       { unit: "milliseconds" },
+    );
+
+    expect(distributionSpy).toHaveBeenCalledWith(
+      "langfuse.queue.clickhouse_writer.time_distribution",
+      expect.any(Number),
+      {
+        entity_type: TableName.Traces,
+        type: "wait",
+        unit: "milliseconds",
+      },
+    );
+
+    expect(distributionSpy).toHaveBeenCalledWith(
+      "langfuse.queue.clickhouse_writer.time_distribution",
+      expect.any(Number),
+      {
+        entity_type: TableName.Traces,
+        type: "processing",
+        unit: "milliseconds",
+      },
     );
   });
 
   it("should handle different types of Clickhouse client errors", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockRejectedValueOnce(new Error("Network error"))
       .mockRejectedValueOnce(new Error("Timeout"))
       .mockResolvedValueOnce();
@@ -303,7 +388,7 @@ describe("ClickhouseWriter", () => {
 
   it("should handle partial queue flush correctly", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockResolvedValue();
     const partialQueueSize = Math.floor(writer.batchSize / 2);
 
@@ -326,7 +411,7 @@ describe("ClickhouseWriter", () => {
 
   it("should continue functioning after encountering an error", async () => {
     const mockInsert = vi
-      .spyOn(serverExports.defaultClickhouseClient, "insert")
+      .spyOn(clickhouseClientMock, "insert")
       .mockRejectedValueOnce(new Error("DB Error"))
       .mockResolvedValue();
 
@@ -338,5 +423,318 @@ describe("ClickhouseWriter", () => {
 
     expect(mockInsert).toHaveBeenCalledTimes(2);
     expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+  });
+
+  describe("Decimal64(12) clamping", () => {
+    describe("clampDecimal64Value", () => {
+      it.each([
+        { input: 0, expected: [0, false], name: "zero" },
+        { input: 0.001, expected: [0.001, false], name: "small positive" },
+        { input: -42.5, expected: [-42.5, false], name: "small negative" },
+        {
+          input: 999_999,
+          expected: [999_999, false],
+          name: "just under limit",
+        },
+        {
+          input: 999_999.999_999,
+          expected: [999_999.999_999, false],
+          name: "max representable",
+        },
+        {
+          input: 1_000_000,
+          expected: [999_999.999_999, true],
+          name: "exact limit",
+        },
+        {
+          input: 8_859_794,
+          expected: [999_999.999_999, true],
+          name: "positive overflow",
+        },
+        {
+          input: -1_000_000,
+          expected: [-999_999.999_999, true],
+          name: "exact negative limit",
+        },
+        {
+          input: -8_859_794,
+          expected: [-999_999.999_999, true],
+          name: "negative overflow",
+        },
+        { input: NaN, expected: [0, true], name: "NaN" },
+        { input: Infinity, expected: [0, true], name: "positive Infinity" },
+        { input: -Infinity, expected: [0, true], name: "negative Infinity" },
+      ])("$name ($input)", ({ input, expected }) => {
+        expect(ClickhouseWriter["clampDecimal64Value"](input)).toEqual(
+          expected,
+        );
+      });
+    });
+
+    describe("clampDecimal64Map", () => {
+      it("returns undefined for undefined input", () => {
+        const result = writer["clampDecimal64Map"](undefined, {
+          recordId: "r1",
+          projectId: "p1",
+          fieldName: "cost_details",
+        });
+        expect(result).toBeUndefined();
+      });
+
+      it("returns original map when no values need clamping", () => {
+        const map = { input: 0.001, output: 42.5 };
+        const result = writer["clampDecimal64Map"](map, {
+          recordId: "r1",
+          projectId: "p1",
+          fieldName: "cost_details",
+        });
+        expect(result).toBe(map); // same reference, no allocation
+        expect(logger.warn).not.toHaveBeenCalled();
+      });
+
+      it("clamps multiple overflowing entries correctly", () => {
+        const result = writer["clampDecimal64Map"](
+          { input: 2_000_000, output: -5_000_000, total: NaN },
+          { recordId: "r1", projectId: "p1", fieldName: "cost_details" },
+        );
+        expect(result).toEqual({
+          input: 999_999.999_999,
+          output: -999_999.999_999,
+          total: 0,
+        });
+      });
+
+      it("clamps only overflowing entries and logs once", () => {
+        const result = writer["clampDecimal64Map"](
+          { input: 0.001, output: 8_859_794 },
+          { recordId: "r1", projectId: "p1", fieldName: "cost_details" },
+        );
+        expect(result).toEqual({ input: 0.001, output: 999_999.999_999 });
+        expect(logger.warn).toHaveBeenCalledWith(
+          "Clamped Decimal64(12) overflow in cost map",
+          expect.objectContaining({
+            projectId: "p1",
+            recordId: "r1",
+            fieldName: "cost_details",
+          }),
+        );
+      });
+    });
+
+    describe("flush integration", () => {
+      it("clamps observation cost fields before inserting", async () => {
+        const mockInsert = vi
+          .spyOn(clickhouseClientMock, "insert")
+          .mockResolvedValue();
+
+        writer.addToQueue(TableName.Observations, {
+          id: "obs-1",
+          project_id: "proj-1",
+          cost_details: { total: 8_859_794 },
+          provided_cost_details: { total: 1_234_567 },
+          total_cost: 9_999_999,
+        } as any);
+        await vi.advanceTimersByTimeAsync(writer.writeInterval);
+
+        const inserted = mockInsert.mock.calls[0][0].values[0];
+        expect(inserted.cost_details.total).toBe(999_999.999_999);
+        expect(inserted.provided_cost_details.total).toBe(999_999.999_999);
+        expect(inserted.total_cost).toBe(999_999.999_999);
+      });
+    });
+  });
+
+  describe("truncation logic", () => {
+    it("should truncate oversized input field", () => {
+      const largeInput = "a".repeat(2 * 1024 * 1024); // 2MB string
+      const record = {
+        id: "1",
+        input: largeInput,
+        output: "normal output",
+        metadata: { key: "value" },
+      } as any;
+
+      const truncatedRecord = writer["truncateOversizedRecord"](
+        TableName.Traces,
+        record,
+      );
+
+      expect(truncatedRecord.id).toBe("1");
+      expect((truncatedRecord as any).output).toBe("normal output");
+      expect((truncatedRecord as any).metadata).toEqual({ key: "value" });
+      expect((truncatedRecord as any).input).toContain(
+        "[TRUNCATED: Field exceeded size limit]",
+      );
+      expect((truncatedRecord as any).input.length).toBeLessThan(
+        largeInput.length,
+      );
+      expect((truncatedRecord as any).input).toMatch(
+        /^a+\[TRUNCATED: Field exceeded size limit]$/,
+      );
+    });
+
+    it("should truncate oversized output field", () => {
+      const largeOutput = "b".repeat(2 * 1024 * 1024); // 2MB string
+      const record = {
+        id: "1",
+        input: "normal input",
+        output: largeOutput,
+        metadata: { key: "value" },
+      };
+
+      const truncatedRecord = writer["truncateOversizedRecord"](
+        TableName.Traces,
+        record,
+      );
+
+      expect(truncatedRecord.id).toBe("1");
+      expect(truncatedRecord.input).toBe("normal input");
+      expect(truncatedRecord.metadata).toEqual({ key: "value" });
+      expect(truncatedRecord.output).toContain(
+        "[TRUNCATED: Field exceeded size limit]",
+      );
+      expect(truncatedRecord.output.length).toBeLessThan(largeOutput.length);
+      expect(truncatedRecord.output).toMatch(
+        /^b+\[TRUNCATED: Field exceeded size limit\]$/,
+      );
+    });
+
+    it("should truncate oversized metadata values", () => {
+      const largeMetadataValue = "c".repeat(2 * 1024 * 1024); // 2MB string
+      const record = {
+        id: "1",
+        input: "normal input",
+        output: "normal output",
+        metadata: {
+          normalKey: "normal value",
+          largeKey: largeMetadataValue,
+          anotherNormalKey: "another normal value",
+        },
+      };
+
+      const truncatedRecord = writer["truncateOversizedRecord"](
+        TableName.Traces,
+        record,
+      );
+
+      expect(truncatedRecord.id).toBe("1");
+      expect(truncatedRecord.input).toBe("normal input");
+      expect(truncatedRecord.output).toBe("normal output");
+      expect(truncatedRecord.metadata.normalKey).toBe("normal value");
+      expect(truncatedRecord.metadata.anotherNormalKey).toBe(
+        "another normal value",
+      );
+      expect(truncatedRecord.metadata.largeKey).toContain(
+        "[TRUNCATED: Field exceeded size limit]",
+      );
+      expect(truncatedRecord.metadata.largeKey.length).toBeLessThan(
+        largeMetadataValue.length,
+      );
+      expect(truncatedRecord.metadata.largeKey).toMatch(
+        /^c+\[TRUNCATED: Field exceeded size limit\]$/,
+      );
+    });
+
+    it("should not truncate normal-sized fields", () => {
+      const normalRecord = {
+        id: "1",
+        input: "normal input",
+        output: "normal output",
+        metadata: { key: "value" },
+      };
+
+      const truncatedRecord = writer["truncateOversizedRecord"](
+        TableName.Traces,
+        normalRecord,
+      );
+
+      expect(truncatedRecord).toEqual(normalRecord);
+    });
+
+    it("should handle size errors with truncation in retry logic", async () => {
+      const largeInput = "a".repeat(2 * 1024 * 1024); // 2MB string
+      const record = {
+        id: "1",
+        input: largeInput,
+        output: "normal output",
+      } as any;
+
+      const mockInsert = vi
+        .spyOn(clickhouseClientMock, "insert")
+        .mockRejectedValueOnce(
+          new Error(
+            "size of json object is extremely large and expected not greater than 1MB",
+          ),
+        )
+        .mockResolvedValueOnce();
+
+      writer.addToQueue(TableName.Traces, record);
+
+      await vi.advanceTimersByTimeAsync(writer.writeInterval);
+
+      expect(mockInsert).toHaveBeenCalledTimes(1);
+      expect(logger.error).toHaveBeenCalledWith(
+        expect.stringContaining("size of json object is extremely large"),
+      );
+
+      // Second attempt with truncated data
+      await vi.advanceTimersByTimeAsync(writer.writeInterval);
+
+      expect(mockInsert).toHaveBeenCalledTimes(2);
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Truncating oversized records"),
+        expect.objectContaining({
+          attemptNumber: 1,
+          error:
+            "size of json object is extremely large and expected not greater than 1MB",
+        }),
+      );
+      expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+
+      // Verify that the second call used truncated data
+      const secondCallArgs = mockInsert.mock.calls[1][0];
+      expect(secondCallArgs.values[0].input).toContain(
+        "[TRUNCATED: Field exceeded size limit]",
+      );
+    });
+
+    it("should handle string length errors with batch splitting", async () => {
+      const mockInsert = vi
+        .spyOn(clickhouseClientMock, "insert")
+        .mockRejectedValueOnce(new Error("invalid string length"))
+        .mockResolvedValue();
+
+      // Add 4 records to test splitting
+      const records = Array.from({ length: 4 }, (_, i) => ({
+        id: `${i}`,
+        name: `test${i}`,
+      }));
+
+      records.forEach((record) => {
+        writer.addToQueue(TableName.Traces, record as any);
+      });
+
+      await vi.advanceTimersByTimeAsync(writer.writeInterval);
+
+      // After first interval: should have done initial call + retry with first half
+      expect(mockInsert).toHaveBeenCalled();
+      expect(logger.warn).toHaveBeenCalledWith(
+        expect.stringContaining("Splitting batch and retrying"),
+        expect.objectContaining({
+          error: "invalid string length",
+          batchSize: 4,
+        }),
+      );
+
+      // Check that queue now has the second half (2 records) at the front
+      expect(writer["queue"][TableName.Traces]).toHaveLength(2);
+      expect(writer["queue"][TableName.Traces][0].data.id).toBe("2");
+      expect(writer["queue"][TableName.Traces][1].data.id).toBe("3");
+
+      // Advance timer again to process the requeued items
+      await vi.advanceTimersByTimeAsync(writer.writeInterval);
+
+      expect(writer["queue"][TableName.Traces]).toHaveLength(0);
+    });
   });
 });

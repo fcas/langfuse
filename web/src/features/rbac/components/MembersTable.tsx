@@ -16,12 +16,11 @@ import useColumnVisibility from "@/src/features/column-visibility/hooks/useColum
 import { CreateProjectMemberButton } from "@/src/features/rbac/components/CreateProjectMemberButton";
 import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { api } from "@/src/utils/api";
+import { safeExtract } from "@/src/utils/map-utils";
 import type { RouterOutput } from "@/src/utils/types";
 import { Role } from "@langfuse/shared";
-import { type Row } from "@tanstack/react-table";
 import { Trash } from "lucide-react";
 import { useSession } from "next-auth/react";
-import { useQueryParams, withDefault, NumberParam } from "use-query-params";
 import { Alert, AlertDescription, AlertTitle } from "@/src/components/ui/alert";
 import { useHasEntitlement } from "@/src/features/entitlements/hooks";
 import { showSuccessToast } from "@/src/features/notifications/showSuccessToast";
@@ -31,10 +30,14 @@ import {
   HoverCard,
   HoverCardContent,
   HoverCardTrigger,
+  HoverCardPortal,
 } from "@/src/components/ui/hover-card";
-import { HoverCardPortal } from "@radix-ui/react-hover-card";
 import Link from "next/link";
 import useColumnOrder from "@/src/features/column-visibility/hooks/useColumnOrder";
+import { SettingsTableCard } from "@/src/components/layouts/settings-table-card";
+import useSessionStorage from "@/src/components/useSessionStorage";
+import { useQueryParam, withDefault, StringParam } from "use-query-params";
+import { useEffect } from "react";
 
 export type MembersTableRow = {
   user: {
@@ -42,6 +45,7 @@ export type MembersTableRow = {
     name: string | null;
   };
   email: string | null;
+  providers: string[];
   createdAt: Date;
   orgRole: Role;
   projectRole?: Role;
@@ -54,10 +58,17 @@ export type MembersTableRow = {
 export function MembersTable({
   orgId,
   project,
+  showSettingsCard = false,
 }: {
   orgId: string;
   project?: { id: string; name: string };
+  showSettingsCard?: boolean;
 }) {
+  // Create a unique key for this table's pagination state
+  const paginationKey = project
+    ? `projectMembers_${project.id}_pagination`
+    : `orgMembers_${orgId}_pagination`;
+
   const session = useSession();
   const hasOrgViewAccess = useHasOrganizationAccess({
     organizationId: orgId,
@@ -68,14 +79,31 @@ export function MembersTable({
       projectId: project?.id,
       scope: "projectMembers:read",
     }) || hasOrgViewAccess;
-  const [paginationState, setPaginationState] = useQueryParams({
-    pageIndex: withDefault(NumberParam, 0),
-    pageSize: withDefault(NumberParam, 10),
-  });
+  const [paginationState, setPaginationState] = useSessionStorage(
+    paginationKey,
+    {
+      pageIndex: 0,
+      pageSize: 10,
+    },
+  );
+
+  const [searchQuery, setSearchQuery] = useQueryParam(
+    "search",
+    withDefault(StringParam, null),
+  );
+
+  useEffect(() => {
+    setPaginationState((prev) => ({
+      pageIndex: 0,
+      pageSize: prev.pageSize,
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchQuery]);
 
   const membersViaOrg = api.members.allFromOrg.useQuery(
     {
       orgId,
+      searchQuery: searchQuery ?? undefined,
       page: paginationState.pageIndex,
       limit: paginationState.pageSize,
     },
@@ -85,8 +113,8 @@ export function MembersTable({
   );
   const membersViaProject = api.members.allFromProject.useQuery(
     {
-      orgId,
       projectId: project?.id ?? "NOT ENABLED",
+      searchQuery: searchQuery ?? undefined,
       page: paginationState.pageIndex,
       limit: paginationState.pageSize,
     },
@@ -102,7 +130,7 @@ export function MembersTable({
 
   const mutDeleteMember = api.members.deleteMembership.useMutation({
     onSuccess: (data) => {
-      if (data.userId === session.data?.user?.id) void session.update();
+      if (data.userId === session.data?.user?.id) session.update();
       utils.members.invalidate();
     },
   });
@@ -153,13 +181,25 @@ export function MembersTable({
       header: "Email",
     },
     {
+      accessorKey: "providers",
+      id: "providers",
+      header: "SSO Provider",
+      enableHiding: true,
+      cell: ({ row }) => {
+        const providers = row.getValue("providers") as string[];
+        if (providers.length === 0) return "-";
+
+        return providers.join(", ");
+      },
+    },
+    {
       accessorKey: "orgRole",
       id: "orgRole",
       header: "Organization Role",
       headerTooltip: {
         description:
           "The org-role is the default role for this user in this organization and applies to the organization and all its projects.",
-        href: "https://langfuse.com/docs/rbac",
+        href: "https://langfuse.com/docs/administration/rbac",
       },
       cell: ({ row }) => {
         const orgRole = row.getValue("orgRole") as MembersTableRow["orgRole"];
@@ -193,7 +233,7 @@ export function MembersTable({
                     side="right"
                   >
                     <p className="text-xs">
-                      The organization-level role can to be edited in the{" "}
+                      The organization-level role can be edited in the{" "}
                       <Link
                         href={`/organization/${orgId}/settings/members`}
                         className="underline"
@@ -213,7 +253,7 @@ export function MembersTable({
       },
     },
     ...(project
-      ? [
+      ? ([
           {
             accessorKey: "projectRole",
             id: "projectRole",
@@ -221,13 +261,9 @@ export function MembersTable({
             headerTooltip: {
               description:
                 "The role for this user in this specific project. This role overrides the default project role.",
-              href: "https://langfuse.com/docs/rbac",
+              href: "https://langfuse.com/docs/administration/rbac",
             },
-            cell: ({
-              row,
-            }: {
-              row: Row<MembersTableRow>; // need to specify the type here due to conditional rendering
-            }) => {
+            cell: ({ row }) => {
               const projectRole = row.getValue(
                 "projectRole",
               ) as MembersTableRow["projectRole"];
@@ -251,7 +287,7 @@ export function MembersTable({
               );
             },
           },
-        ]
+        ] satisfies LangfuseColumnDef<MembersTableRow>[])
       : []),
     {
       accessorKey: "createdAt",
@@ -298,10 +334,13 @@ export function MembersTable({
   ];
 
   const [columnVisibility, setColumnVisibility] =
-    useColumnVisibility<MembersTableRow>("membersColumnVisibility", columns);
+    useColumnVisibility<MembersTableRow>(
+      project ? "membersColumnVisibilityProject" : "membersColumnVisibilityOrg",
+      columns,
+    );
 
   const [columnOrder, setColumnOrder] = useColumnOrder<MembersTableRow>(
-    "membersColumnOrder",
+    project ? "membersColumnOrderProject" : "membersColumnOrderOrg",
     columns,
   );
 
@@ -318,6 +357,7 @@ export function MembersTable({
         image: orgMembership.user.image,
         name: orgMembership.user.name,
       },
+      providers: orgMembership.user.accounts?.map((a) => a.provider) ?? [],
       createdAt: orgMembership.createdAt,
       orgRole: orgMembership.role,
       projectRole: orgMembership.projectRole,
@@ -346,36 +386,83 @@ export function MembersTable({
         actionButtons={
           <CreateProjectMemberButton orgId={orgId} project={project} />
         }
-      />
-      <DataTable
-        columns={columns}
-        data={
-          members.isLoading
-            ? { isLoading: true, isError: false }
-            : members.isError
-              ? {
-                  isLoading: false,
-                  isError: true,
-                  error: members.error.message,
-                }
-              : {
-                  isLoading: false,
-                  isError: false,
-                  data: members.data.memberships.map((t) =>
-                    convertToTableRow(t),
-                  ),
-                }
-        }
-        pagination={{
-          totalCount,
-          onChange: setPaginationState,
-          state: paginationState,
+        searchConfig={{
+          metadataSearchFields: ["Name", "Email"],
+          updateQuery: setSearchQuery,
+          currentQuery: searchQuery ?? undefined,
+          tableAllowsFullTextSearch: false,
+          setSearchType: undefined,
+          searchType: undefined,
         }}
-        columnVisibility={columnVisibility}
-        onColumnVisibilityChange={setColumnVisibility}
-        columnOrder={columnOrder}
-        onColumnOrderChange={setColumnOrder}
+        className={showSettingsCard ? "px-0" : undefined}
       />
+      {showSettingsCard ? (
+        <SettingsTableCard>
+          <DataTable
+            tableName={project ? "projectMembers" : "orgMembers"}
+            columns={columns}
+            data={
+              members.isPending
+                ? { isLoading: true, isError: false }
+                : members.isError
+                  ? {
+                      isLoading: false,
+                      isError: true,
+                      error: members.error.message,
+                    }
+                  : {
+                      isLoading: false,
+                      isError: false,
+                      data: safeExtract(members.data, "memberships", []).map(
+                        (t) => convertToTableRow(t),
+                      ),
+                    }
+            }
+            pagination={{
+              totalCount,
+              onChange: setPaginationState,
+              state: paginationState,
+            }}
+            columnVisibility={columnVisibility}
+            onColumnVisibilityChange={setColumnVisibility}
+            columnOrder={columnOrder}
+            onColumnOrderChange={setColumnOrder}
+            cellPadding="comfortable"
+          />
+        </SettingsTableCard>
+      ) : (
+        <DataTable
+          tableName={project ? "projectMembers" : "orgMembers"}
+          columns={columns}
+          data={
+            members.isPending
+              ? { isLoading: true, isError: false }
+              : members.isError
+                ? {
+                    isLoading: false,
+                    isError: true,
+                    error: members.error.message,
+                  }
+                : {
+                    isLoading: false,
+                    isError: false,
+                    data: safeExtract(members.data, "memberships", []).map(
+                      (t) => convertToTableRow(t),
+                    ),
+                  }
+          }
+          pagination={{
+            totalCount,
+            onChange: setPaginationState,
+            state: paginationState,
+          }}
+          columnVisibility={columnVisibility}
+          onColumnVisibilityChange={setColumnVisibility}
+          columnOrder={columnOrder}
+          onColumnOrderChange={setColumnOrder}
+          cellPadding="comfortable"
+        />
+      )}
     </>
   );
 }
@@ -398,7 +485,7 @@ const OrgRoleDropdown = ({
   const mut = api.members.updateOrgMembership.useMutation({
     onSuccess: (data) => {
       utils.members.invalidate();
-      if (data.userId === session.data?.user?.id) void session.update();
+      if (data.userId === session.data?.user?.id) session.update();
       showSuccessToast({
         title: "Saved",
         description: "Organization role updated successfully",
@@ -409,7 +496,7 @@ const OrgRoleDropdown = ({
 
   return (
     <Select
-      disabled={!hasCudAccess || mut.isLoading}
+      disabled={!hasCudAccess || mut.isPending}
       value={currentRole}
       onValueChange={(value) => {
         if (
@@ -458,7 +545,7 @@ const ProjectRoleDropdown = ({
   const mut = api.members.updateProjectRole.useMutation({
     onSuccess: (data) => {
       utils.members.invalidate();
-      if (data.userId === session.data?.user?.id) void session.update();
+      if (data.userId === session.data?.user?.id) session.update();
       showSuccessToast({
         title: "Saved",
         description: "Project role updated successfully",
@@ -469,7 +556,7 @@ const ProjectRoleDropdown = ({
 
   return (
     <Select
-      disabled={!hasCudAccess || mut.isLoading}
+      disabled={!hasCudAccess || mut.isPending}
       value={currentProjectRole ?? Role.NONE}
       onValueChange={(value) => {
         if (

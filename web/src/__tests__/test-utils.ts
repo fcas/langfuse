@@ -1,44 +1,114 @@
-import { env } from "@/src/env.mjs";
-import { prisma } from "@langfuse/shared/src/db";
 import {
-  clickhouseClient,
+  CodeEvalExecutionQueue,
+  EvalExecutionQueue,
+  LLMAsJudgeExecutionQueue,
+  SecondaryEvalExecutionQueue,
+  SecondaryIngestionQueue,
+  SecondaryOtelIngestionQueue,
   createBasicAuthHeader,
+  getQueue,
+  IngestionQueue,
+  logger,
+  OtelIngestionQueue,
+  QueueName,
+  TraceUpsertQueue,
 } from "@langfuse/shared/src/server";
 import { type z } from "zod";
 
-export const pruneDatabase = async () => {
-  if (!env.DATABASE_URL.includes("localhost:5432")) {
-    throw new Error("You cannot prune database unless running on localhost.");
-  }
+export const getQueues = () => {
+  const queues: string[] = Object.values(QueueName);
+  queues.push(
+    ...IngestionQueue.getShardNames(),
+    ...SecondaryIngestionQueue.getShardNames(),
+    ...EvalExecutionQueue.getShardNames(),
+    ...SecondaryEvalExecutionQueue.getShardNames(),
+    ...LLMAsJudgeExecutionQueue.getShardNames(),
+    ...CodeEvalExecutionQueue.getShardNames(),
+    ...OtelIngestionQueue.getShardNames(),
+    ...SecondaryOtelIngestionQueue.getShardNames(),
+    ...TraceUpsertQueue.getShardNames(),
+  );
 
-  await prisma.score.deleteMany();
-  await prisma.scoreConfig.deleteMany();
-  await prisma.observation.deleteMany();
-  await prisma.trace.deleteMany();
-  await prisma.traceSession.deleteMany();
-  await prisma.datasetItem.deleteMany();
-  await prisma.dataset.deleteMany();
-  await prisma.datasetRuns.deleteMany();
-  await prisma.prompt.deleteMany();
-  await prisma.events.deleteMany();
-  await prisma.model.deleteMany();
-  await prisma.llmApiKeys.deleteMany();
-  await prisma.comment.deleteMany();
-  await prisma.media.deleteMany();
+  const listOfQueuesToIgnore = [
+    QueueName.DataRetentionQueue,
+    QueueName.BlobStorageIntegrationQueue,
+    QueueName.DeadLetterRetryQueue,
+    QueueName.PostHogIntegrationQueue,
+    QueueName.CloudFreeTierUsageThresholdQueue,
+  ];
 
-  if (!env.CLICKHOUSE_URL?.includes("localhost:8123")) {
-    throw new Error("You cannot prune clickhouse unless running on localhost.");
-  }
+  return queues
+    .filter(
+      (queueName) => !listOfQueuesToIgnore.includes(queueName as QueueName),
+    )
+    .map((queueName) =>
+      queueName.startsWith(QueueName.IngestionQueue)
+        ? IngestionQueue.getInstance({ shardName: queueName })
+        : queueName.startsWith(QueueName.IngestionSecondaryQueue)
+          ? SecondaryIngestionQueue.getInstance({ shardName: queueName })
+          : queueName.startsWith(QueueName.EvaluationExecution)
+            ? EvalExecutionQueue.getInstance({ shardName: queueName })
+            : queueName.startsWith(QueueName.EvaluationExecutionSecondaryQueue)
+              ? SecondaryEvalExecutionQueue.getInstance({
+                  shardName: queueName,
+                })
+              : queueName.startsWith(QueueName.LLMAsJudgeExecution)
+                ? LLMAsJudgeExecutionQueue.getInstance({
+                    shardName: queueName,
+                  })
+                : queueName.startsWith(QueueName.CodeEvalExecution)
+                  ? CodeEvalExecutionQueue.getInstance({
+                      shardName: queueName,
+                    })
+                  : queueName.startsWith(QueueName.TraceUpsert)
+                    ? TraceUpsertQueue.getInstance({ shardName: queueName })
+                    : queueName.startsWith(
+                          QueueName.OtelIngestionSecondaryQueue,
+                        )
+                      ? SecondaryOtelIngestionQueue.getInstance({
+                          shardName: queueName,
+                        })
+                      : queueName.startsWith(QueueName.OtelIngestionQueue)
+                        ? OtelIngestionQueue.getInstance({
+                            shardName: queueName,
+                          })
+                        : getQueue(
+                            queueName as Exclude<
+                              QueueName,
+                              | QueueName.IngestionQueue
+                              | QueueName.IngestionSecondaryQueue
+                              | QueueName.EvaluationExecution
+                              | QueueName.EvaluationExecutionSecondaryQueue
+                              | QueueName.LLMAsJudgeExecution
+                              | QueueName.CodeEvalExecution
+                              | QueueName.TraceUpsert
+                              | QueueName.OtelIngestionQueue
+                              | QueueName.OtelIngestionSecondaryQueue
+                            >,
+                          ),
+    );
+};
 
-  await clickhouseClient().command({
-    query: "TRUNCATE TABLE IF EXISTS observations",
-  });
-  await clickhouseClient().command({
-    query: "TRUNCATE TABLE IF EXISTS scores",
-  });
-  await clickhouseClient().command({
-    query: "TRUNCATE TABLE IF EXISTS traces",
-  });
+export const disconnectQueues = async (disconnectTimeoutMs = 2_000) => {
+  await Promise.all(
+    getQueues().map(async (queue) => {
+      if (queue) {
+        let timeoutId: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([
+            queue.disconnect(),
+            new Promise<void>((resolve) => {
+              timeoutId = setTimeout(resolve, disconnectTimeoutMs);
+            }),
+          ]);
+        } catch (error) {
+          logger.error(`Error disconnecting queue ${queue.name}: ${error}`);
+        } finally {
+          if (timeoutId) clearTimeout(timeoutId);
+        }
+      }
+    }),
+  );
 };
 
 export type IngestionAPIResponse = {
@@ -63,8 +133,9 @@ export async function makeAPICall<T = IngestionAPIResponse>(
   url: string,
   body?: unknown,
   auth?: string,
+  customHeaders?: Record<string, string>,
 ): Promise<{ body: T; status: number }> {
-  const finalUrl = `http://localhost:3000/${url}`;
+  const finalUrl = `http://localhost:3000${url.startsWith("/") ? url : `/${url}`}`;
   const authorization =
     auth || createBasicAuthHeader("pk-lf-1234567890", "sk-lf-1234567890");
   const options = {
@@ -73,26 +144,50 @@ export async function makeAPICall<T = IngestionAPIResponse>(
       Accept: "application/json",
       "Content-Type": "application/json;charset=UTF-8",
       Authorization: authorization,
+      ...customHeaders,
     },
     ...(method !== "GET" &&
       body !== undefined && { body: JSON.stringify(body) }),
   };
   const response = await fetch(finalUrl, options);
-  const responseBody = (await response.json()) as T;
-  return { body: responseBody, status: response.status };
+
+  // Handle 204 No Content - no body to parse
+  if (response.status === 204) {
+    return { body: {} as T, status: response.status };
+  }
+
+  // Clone the response before attempting to parse JSON
+  const clonedResponse = response.clone();
+
+  try {
+    const responseBody = (await response.json()) as T;
+    return { body: responseBody, status: response.status };
+  } catch (error) {
+    // Handle JSON parsing errors using the cloned response
+    const responseText = await clonedResponse.text();
+    throw new Error(
+      `Failed to parse JSON response: ${error instanceof Error ? error.message : String(error)}. Response status: ${response.status}. Response headers: ${JSON.stringify(Object.fromEntries(response.headers.entries()))}. Response text: ${responseText}. Method: ${method}, URL: ${finalUrl}, Request body: ${body ? JSON.stringify(body) : "none"}`,
+    );
+  }
 }
 
-export async function makeZodVerifiedAPICall<T extends z.ZodTypeAny>(
+export async function makeZodVerifiedAPICall<T extends z.ZodType>(
   responseZodSchema: T,
   method: "POST" | "GET" | "PUT" | "DELETE" | "PATCH",
   url: string,
   body?: unknown,
   auth?: string,
+  statusCode = 200,
 ): Promise<{ body: z.infer<T>; status: number }> {
-  const { body: resBody, status } = await makeAPICall(method, url, body, auth);
-  if (status !== 200) {
+  const { body: resBody, status } = await makeAPICall<z.infer<T>>(
+    method,
+    url,
+    body,
+    auth,
+  );
+  if (status !== statusCode) {
     throw new Error(
-      `API call did not return 200, returned status ${status}, body ${JSON.stringify(resBody)}`,
+      `API call did not return ${statusCode}, returned status ${status}, body ${JSON.stringify(resBody)}`,
     );
   }
   const typeCheckResult = responseZodSchema.safeParse(resBody);
@@ -105,14 +200,19 @@ export async function makeZodVerifiedAPICall<T extends z.ZodTypeAny>(
   return { body: resBody, status };
 }
 
-export async function makeZodVerifiedAPICallSilent<T extends z.ZodTypeAny>(
+export async function makeZodVerifiedAPICallSilent<T extends z.ZodType>(
   responseZodSchema: T,
   method: "POST" | "GET" | "PUT" | "DELETE" | "PATCH",
   url: string,
   body?: unknown,
   auth?: string,
 ): Promise<{ body: z.infer<T>; status: number }> {
-  const { body: resBody, status } = await makeAPICall(method, url, body, auth);
+  const { body: resBody, status } = await makeAPICall<z.infer<T>>(
+    method,
+    url,
+    body,
+    auth,
+  );
 
   if (status === 200) {
     const typeCheckResult = responseZodSchema.safeParse(resBody);

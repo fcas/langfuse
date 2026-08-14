@@ -11,10 +11,8 @@ import {
   FormMessage,
 } from "@/src/components/ui/form";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
-import { useRouter } from "next/router";
+import { api, reportTrpcErrorWithoutToast } from "@/src/utils/api";
 import { useSession } from "next-auth/react";
-import { chatRunTrigger } from "@/src/features/support-chat/chat";
 import { projectNameSchema } from "@/src/features/auth/lib/projectNameSchema";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 
@@ -28,17 +26,15 @@ export const NewProjectForm = ({
   const capture = usePostHogClientCapture();
   const { update: updateSession } = useSession();
 
-  const form = useForm<z.infer<typeof projectNameSchema>>({
+  const form = useForm({
     resolver: zodResolver(projectNameSchema),
     defaultValues: {
       name: "",
     },
   });
-  const router = useRouter();
   const createProjectMutation = api.projects.create.useMutation({
-    onSuccess: (newProject) => {
-      void updateSession();
-      void router.push(`/project/${newProject.id}/settings`);
+    onSuccess: () => {
+      updateSession();
     },
     onError: (error) => form.setError("name", { message: error.message }),
   });
@@ -54,18 +50,20 @@ export const NewProjectForm = ({
         onSuccess(project.id);
         form.reset();
       })
-      .catch((error) => {
-        console.error(error);
-      });
-    chatRunTrigger("after-project-creation");
+      .catch((error) => reportTrpcErrorWithoutToast(error, "projects"));
   }
   return (
     <Form {...form}>
       <form
-        // eslint-disable-next-line @typescript-eslint/no-misused-promises
         onSubmit={form.handleSubmit(onSubmit)}
         className="space-y-3"
         data-testid="new-project-form"
+        onKeyDown={(e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+            e.preventDefault();
+            form.handleSubmit(onSubmit)();
+          }
+        }}
       >
         <FormField
           control={form.control}
@@ -84,7 +82,7 @@ export const NewProjectForm = ({
             </FormItem>
           )}
         />
-        <Button type="submit" loading={createProjectMutation.isLoading}>
+        <Button type="submit" loading={createProjectMutation.isPending}>
           Create
         </Button>
       </form>

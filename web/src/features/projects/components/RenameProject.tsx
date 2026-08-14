@@ -1,7 +1,7 @@
 import { Card } from "@/src/components/ui/card";
 import { Button } from "@/src/components/ui/button";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
+import { api, reportTrpcErrorWithoutToast } from "@/src/utils/api";
 import type * as z from "zod";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useForm } from "react-hook-form";
@@ -22,6 +22,7 @@ import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAcces
 
 export default function RenameProject() {
   const { update: updateSession } = useSession();
+  const utils = api.useUtils();
   const { project } = useQueryProject();
   const capture = usePostHogClientCapture();
   const hasAccess = useHasProjectAccess({
@@ -29,7 +30,7 @@ export default function RenameProject() {
     scope: "project:update",
   });
 
-  const form = useForm<z.infer<typeof projectNameSchema>>({
+  const form = useForm({
     resolver: zodResolver(projectNameSchema),
     defaultValues: {
       name: "",
@@ -37,7 +38,10 @@ export default function RenameProject() {
   });
   const renameProject = api.projects.update.useMutation({
     onSuccess: (_) => {
-      void updateSession();
+      updateSession();
+      // Admins resolve org/project context from these queries, not the session
+      utils.organizations.byId.invalidate();
+      utils.projects.byId.invalidate();
     },
     onError: (error) => form.setError("name", { message: error.message }),
   });
@@ -53,24 +57,22 @@ export default function RenameProject() {
       .then(() => {
         form.reset();
       })
-      .catch((error) => {
-        console.error(error);
-      });
+      .catch((error) => reportTrpcErrorWithoutToast(error, "projects"));
   }
 
   return (
     <div>
-      <Header title="Project Name" level="h3" />
+      <Header title="Project Name" />
       <Card className="mb-4 p-3">
         {form.getValues().name !== "" ? (
-          <p className="mb-4 text-sm text-primary">
+          <p className="text-primary mb-4 text-sm">
             Your Project will be renamed from &quot;
             {project?.name ?? ""}
             &quot; to &quot;
             <b>{form.watch().name}</b>&quot;.
           </p>
         ) : (
-          <p className="mb-4 text-sm text-primary">
+          <p className="text-primary mb-4 text-sm">
             Your Project is currently named &quot;
             <b>{project?.name ?? ""}</b>
             &quot;.
@@ -78,7 +80,6 @@ export default function RenameProject() {
         )}
         <Form {...form}>
           <form
-            // eslint-disable-next-line @typescript-eslint/no-misused-promises
             onSubmit={form.handleSubmit(onSubmit)}
             className="flex-1"
             id="rename-project-form"
@@ -98,7 +99,7 @@ export default function RenameProject() {
                       />
                       {!hasAccess && (
                         <span title="No access">
-                          <LockIcon className="absolute right-3 top-1/2 h-4 w-4 -translate-y-1/2 transform text-muted" />
+                          <LockIcon className="text-muted absolute top-1/2 right-3 h-4 w-4 -translate-y-1/2 transform" />
                         </span>
                       )}
                     </div>
@@ -111,7 +112,7 @@ export default function RenameProject() {
               <Button
                 variant="secondary"
                 type="submit"
-                loading={renameProject.isLoading}
+                loading={renameProject.isPending}
                 disabled={form.getValues().name === "" || !hasAccess}
                 className="mt-4"
               >

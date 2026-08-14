@@ -1,31 +1,42 @@
 import { env } from "@/src/env.mjs";
 import {
-  addUserToSpan,
   createShaHash,
+  deleteApiKeyFromDb,
   recordIncrement,
   verifySecretKey,
   type AuthHeaderVerificationResult,
   CachedApiKey,
   OrgEnrichedApiKey,
   logger,
+  instrumentAsync,
+  addUserToSpan,
+  invalidateCachedApiKeys as invalidateCachedApiKeysShared,
+  invalidateCachedOrgApiKeys as invalidateCachedOrgApiKeysShared,
+  invalidateCachedProjectApiKeys as invalidateCachedProjectApiKeysShared,
+  createApiKeyCacheKey,
 } from "@langfuse/shared/src/server";
 import {
   type PrismaClient,
   type ApiKey,
   type Prisma,
+  type ApiKeyScope,
 } from "@langfuse/shared/src/db";
 import { isPrismaException } from "@/src/utils/exceptions";
-import { type Redis } from "ioredis";
+import { type Redis, type Cluster } from "ioredis";
 import { getOrganizationPlanServerSide } from "@/src/features/entitlements/server/getPlan";
 import { API_KEY_NON_EXISTENT } from "@langfuse/shared/src/server";
 import { type z } from "zod";
 import { CloudConfigSchema, isPlan } from "@langfuse/shared";
 
+type VerifyAuthHeaderOptions = {
+  allowInAppAgentKey?: boolean;
+};
+
 export class ApiAuthService {
   prisma: PrismaClient;
-  redis: Redis | null;
+  redis: Redis | Cluster | null;
 
-  constructor(prisma: PrismaClient, redis: Redis | null) {
+  constructor(prisma: PrismaClient, redis: Redis | Cluster | null) {
     this.prisma = prisma;
     this.redis = redis;
   }
@@ -33,213 +44,253 @@ export class ApiAuthService {
   // this function needs to be called, when the organisation is updated
   // - when projects move across organisations, the orgId in the API key cache needs to be updated
   // - when the plan of the org changes, the plan in the API key cache needs to be updated as well
-  async invalidate(apiKeys: ApiKey[], identifier: string) {
-    const hashKeys = apiKeys.map((key) => key.fastHashedSecretKey);
-
-    const filteredHashKeys = hashKeys.filter((hash): hash is string =>
-      Boolean(hash),
-    );
-    if (filteredHashKeys.length === 0) {
-      logger.info("No valid keys to invalidate");
-      return;
-    }
-
-    if (this.redis) {
-      logger.info(`Invalidating API keys in redis for ${identifier}`);
-      await this.redis.del(
-        filteredHashKeys.map((hash) => this.createRedisKey(hash)),
-      );
-    }
+  async invalidateCachedApiKeys(apiKeys: ApiKey[], identifier: string) {
+    await invalidateCachedApiKeysShared(apiKeys, identifier, this.redis);
   }
 
-  async invalidateOrgApiKeys(orgId: string) {
-    const apiKeys = await this.prisma.apiKey.findMany({
-      where: {
-        project: {
-          orgId: orgId,
-        },
-      },
-    });
-
-    await this.invalidate(apiKeys, `org ${orgId}`);
+  async invalidateCachedOrgApiKeys(orgId: string) {
+    await invalidateCachedOrgApiKeysShared(orgId, this.redis);
   }
 
-  async invalidateProjectApiKeys(projectId: string) {
-    const apiKeys = await this.prisma.apiKey.findMany({
-      where: {
-        projectId: projectId,
-      },
-    });
-
-    await this.invalidate(apiKeys, `project ${projectId}`);
+  async invalidateCachedProjectApiKeys(projectId: string) {
+    await invalidateCachedProjectApiKeysShared(projectId, this.redis);
   }
 
-  async deleteApiKey(id: string, projectId: string) {
-    // Make sure the API key exists and belongs to the project the user has access to
-    const apiKey = await this.prisma.apiKey.findFirstOrThrow({
-      where: {
-        id: id,
-        projectId: projectId,
-      },
+  /**
+   * Deletes an API key from the database and invalidates it in Redis if available.
+   * @param id - The ID of the API key to delete.
+   * @param entityId - The ID of the entity (project or organization) to which the API key belongs.
+   * @param scope - The scope of the API key (either "PROJECT" or "ORGANIZATION").
+   */
+  async deleteApiKey(id: string, entityId: string, scope: ApiKeyScope) {
+    return deleteApiKeyFromDb({
+      prisma: this.prisma,
+      id,
+      entityId,
+      scope,
+      redis: this.redis,
     });
-    if (!apiKey) {
-      return false;
-    }
-
-    // if redis is available, delete the key from there as well
-    // delete from redis even if caching is disabled via env for consistency
-    this.invalidate([apiKey], `key ${id}`);
-
-    await this.prisma.apiKey.delete({
-      where: {
-        id: apiKey.id,
-      },
-    });
-    return true;
   }
 
   async verifyAuthHeaderAndReturnScope(
     authHeader: string | undefined,
+    options: VerifyAuthHeaderOptions = {},
   ): Promise<AuthHeaderVerificationResult> {
-    if (!authHeader) {
-      logger.error("No authorization header");
-      return {
-        validKey: false,
-        error: "No authorization header",
-      };
-    }
+    const result: AuthHeaderVerificationResult = await instrumentAsync(
+      { name: "api-auth-verify" },
+      async (span) => {
+        if (!authHeader) {
+          logger.debug("No authorization header");
+          return {
+            validKey: false,
+            error: "No authorization header",
+          };
+        }
 
-    try {
-      // Basic auth, full scope, needs secret key and public key
-      if (authHeader.startsWith("Basic ")) {
-        const { username: publicKey, password: secretKey } =
-          this.extractBasicAuthCredentials(authHeader);
+        try {
+          // Basic auth, full scope, needs secret key and public key
+          if (authHeader.startsWith("Basic ")) {
+            const { username: publicKey, password: secretKey } =
+              this.extractBasicAuthCredentials(authHeader);
 
-        const salt = env.SALT;
-        const hashFromProvidedKey = createShaHash(secretKey, salt);
+            const salt = env.SALT;
+            const hashFromProvidedKey = createShaHash(secretKey, salt);
 
-        // fetches by redis if available, fallback to postgres
-        // api key from redis does
-        const apiKey = await this.fetchApiKeyAndAddToRedis(hashFromProvidedKey);
+            // fetches by redis if available, fallback to postgres
+            // api key from redis does
+            const apiKey =
+              await this.fetchApiKeyAndAddToRedis(hashFromProvidedKey);
 
-        let finalApiKey = apiKey;
+            let finalApiKey = apiKey;
 
-        if (!apiKey || !apiKey.fastHashedSecretKey) {
-          const slowKey = await this.prisma.apiKey.findUnique({
-            where: { publicKey },
-            include: { project: { include: { organization: true } } },
-          });
+            if (!apiKey || !apiKey.fastHashedSecretKey) {
+              const slowKey = await this.prisma.apiKey.findUnique({
+                where: { publicKey },
+                include: {
+                  project: { include: { organization: true } },
+                  organization: true,
+                },
+              });
 
-          if (!slowKey) {
-            logger.error("No key found for public key", publicKey);
-            if (this.redis) {
-              logger.info(
-                `No key found, storing ${API_KEY_NON_EXISTENT} in redis`,
+              if (!slowKey) {
+                logger.error("No key found for public key", publicKey);
+                if (this.redis) {
+                  logger.info(
+                    `No key found, storing ${API_KEY_NON_EXISTENT} in redis`,
+                  );
+                  await this.addApiKeyToRedis(
+                    hashFromProvidedKey,
+                    API_KEY_NON_EXISTENT,
+                  );
+                }
+                throw new Error("Invalid credentials");
+              }
+
+              const isValid = await verifySecretKey(
+                secretKey,
+                slowKey.hashedSecretKey,
               );
-              await this.addApiKeyToRedis(
-                hashFromProvidedKey,
-                API_KEY_NON_EXISTENT,
+
+              if (!isValid) {
+                logger.debug(`Old key is invalid: ${publicKey}`);
+                throw new Error("Invalid credentials");
+              }
+
+              const shaKey = createShaHash(secretKey, salt);
+
+              await this.prisma.apiKey.update({
+                where: { publicKey },
+                data: {
+                  fastHashedSecretKey: shaKey,
+                },
+              });
+              finalApiKey = this.convertToRedisRepresentation({
+                ...slowKey,
+                fastHashedSecretKey: shaKey,
+              });
+            }
+
+            if (!finalApiKey) {
+              logger.info("No project id found for key", publicKey);
+              throw new Error("Invalid credentials");
+            }
+
+            const plan = finalApiKey.plan;
+
+            if (!isPlan(plan)) {
+              logger.error("Invalid plan type for key", finalApiKey.plan);
+              throw new Error("Invalid credentials");
+            }
+
+            addUserToSpan(
+              {
+                projectId: finalApiKey.projectId ?? undefined,
+                orgId: finalApiKey.orgId,
+                plan,
+                apiKeyId: finalApiKey.id,
+                publicKey: finalApiKey.publicKey,
+              },
+              span,
+            );
+
+            const accessLevel =
+              finalApiKey.scope === "ORGANIZATION"
+                ? ("organization" as const)
+                : ("project" as const);
+
+            // The API key is resolved via the hash of the secret key, so the
+            // submitted public key may not belong to it, e.g. after a partial
+            // credential rotation on the client.
+            if (publicKey !== finalApiKey.publicKey) {
+              logger.warn(
+                `Public key mismatch on basic auth: submitted public key ${publicKey} does not match public key ${finalApiKey.publicKey} of the API key resolved via the secret key (apiKeyId ${finalApiKey.id}, projectId ${finalApiKey.projectId}, orgId ${finalApiKey.orgId})`,
               );
             }
-            throw new Error("Invalid credentials");
-          }
 
-          const isValid = await verifySecretKey(
-            secretKey,
-            slowKey.hashedSecretKey,
+            const result = {
+              validKey: true as const,
+              scope: {
+                projectId: finalApiKey.projectId,
+                accessLevel,
+                orgId: finalApiKey.orgId,
+                plan: plan,
+                rateLimitOverrides: finalApiKey.rateLimitOverrides ?? [],
+                apiKeyId: finalApiKey.id,
+                scope: finalApiKey.scope,
+                publicKey: finalApiKey.publicKey,
+                isIngestionSuspended: finalApiKey.isIngestionSuspended,
+                isInAppAgentKey: finalApiKey.isInAppAgentKey,
+              },
+            };
+
+            return result;
+          }
+          // Bearer auth, limited scope, only needs public key
+          if (authHeader.startsWith("Bearer ")) {
+            const publicKey = authHeader.replace("Bearer ", "");
+
+            const dbKey = await this.findDbKeyOrThrow(publicKey);
+
+            if (dbKey.scope === "ORGANIZATION") {
+              throw new Error(
+                "Unauthorized: Cannot use organization key with bearer auth",
+              );
+            }
+
+            const { orgId, cloudConfig, cloudFreeTierUsageThresholdState } =
+              this.extractOrgIdAndCloudConfig(dbKey);
+            const plan = getOrganizationPlanServerSide(cloudConfig);
+
+            addUserToSpan(
+              {
+                projectId: dbKey.projectId ?? undefined,
+                orgId,
+                plan,
+                apiKeyId: dbKey.id,
+                publicKey: dbKey.publicKey,
+              },
+              span,
+            );
+
+            const result = {
+              validKey: true as const,
+              scope: {
+                projectId: dbKey.projectId,
+                accessLevel: "scores" as const,
+                orgId,
+                plan,
+                rateLimitOverrides: cloudConfig?.rateLimitOverrides ?? [],
+                apiKeyId: dbKey.id,
+                scope: dbKey.scope,
+                publicKey,
+                isInAppAgentKey: dbKey.isInAppAgentKey,
+                isIngestionSuspended:
+                  cloudFreeTierUsageThresholdState === "BLOCKED",
+              },
+            };
+
+            return result;
+          }
+        } catch (error: unknown) {
+          logger.info(
+            `Error verifying auth header: ${error instanceof Error ? error.message : null}`,
+            error,
           );
 
-          if (!isValid) {
-            logger.debug(`Old key is invalid: ${publicKey}`);
-            throw new Error("Invalid credentials");
+          if (isPrismaException(error)) {
+            throw error;
           }
 
-          const shaKey = createShaHash(secretKey, salt);
-
-          await this.prisma.apiKey.update({
-            where: { publicKey },
-            data: {
-              fastHashedSecretKey: shaKey,
-            },
-          });
-          finalApiKey = convertToRedisRepresentation({
-            ...slowKey,
-            fastHashedSecretKey: shaKey,
-          });
+          return {
+            validKey: false,
+            error:
+              (error instanceof Error ? error.message : "Authorization error") +
+              ". Confirm that you've configured the correct host.",
+          };
         }
-
-        if (!finalApiKey) {
-          logger.info("No project id found for key", publicKey);
-          throw new Error("Invalid credentials");
-        }
-
-        addUserToSpan({ projectId: finalApiKey.projectId });
-
-        const plan = finalApiKey.plan;
-
-        if (!isPlan(plan)) {
-          logger.error("Invalid plan type for key", finalApiKey.plan);
-          throw new Error("Invalid credentials");
-        }
-
         return {
-          validKey: true,
-          scope: {
-            projectId: finalApiKey.projectId,
-            accessLevel: "all",
-            orgId: finalApiKey.orgId,
-            plan: plan,
-            rateLimitOverrides: finalApiKey.rateLimitOverrides ?? [],
-          },
+          validKey: false,
+          error: "Invalid authorization header",
         };
-      }
-      // Bearer auth, limited scope, only needs public key
-      if (authHeader.startsWith("Bearer ")) {
-        const publicKey = authHeader.replace("Bearer ", "");
+      },
+    );
 
-        const dbKey = await this.findDbKeyOrThrow(publicKey);
-
-        addUserToSpan({ projectId: dbKey.projectId });
-
-        const cloudConfig = dbKey.project.organization.cloudConfig
-          ? CloudConfigSchema.parse(dbKey.project.organization.cloudConfig)
-          : undefined;
-
-        return {
-          validKey: true,
-          scope: {
-            projectId: dbKey.projectId,
-            accessLevel: "scores",
-            orgId: dbKey.project.organization.id,
-            plan: getOrganizationPlanServerSide(cloudConfig),
-            rateLimitOverrides: cloudConfig?.rateLimitOverrides ?? [],
-          },
-        };
-      }
-    } catch (error: unknown) {
-      logger.error(
-        `Error verifying auth header: ${error instanceof Error ? error.message : null}`,
-        error,
-      );
-
-      if (isPrismaException(error)) {
-        throw error;
-      }
-
+    if (
+      result.validKey &&
+      result.scope.isInAppAgentKey === true &&
+      options.allowInAppAgentKey !== true
+    ) {
       return {
         validKey: false,
         error:
-          (error instanceof Error ? error.message : "Authorization error") +
-          ". Confirm that you've configured the correct host.",
+          "Access denied - in-app agent keys are not allowed for this endpoint",
       };
     }
-    return {
-      validKey: false,
-      error: "Invalid authorization header",
-    };
+
+    return result;
   }
 
-  extractBasicAuthCredentials(basicAuthHeader: string): {
+  private extractBasicAuthCredentials(basicAuthHeader: string): {
     username: string;
     password: string;
   } {
@@ -251,10 +302,13 @@ export class ApiAuthService {
     return { username, password };
   }
 
-  async findDbKeyOrThrow(publicKey: string) {
+  private async findDbKeyOrThrow(publicKey: string) {
     const dbKey = await this.prisma.apiKey.findUnique({
       where: { publicKey },
-      include: { project: { include: { organization: true } } },
+      include: {
+        project: { include: { organization: true } },
+        organization: true,
+      },
     });
     if (!dbKey) {
       logger.info("No api key found for public key:", publicKey);
@@ -263,7 +317,7 @@ export class ApiAuthService {
     return dbKey;
   }
 
-  async fetchApiKeyAndAddToRedis(hash: string) {
+  private async fetchApiKeyAndAddToRedis(hash: string) {
     // first get the API key from redis, this does not throw
     const redisApiKey = await this.fetchApiKeyFromRedis(hash);
 
@@ -283,23 +337,26 @@ export class ApiAuthService {
     // if redis not available or object not found, try the database
     const apiKeyAndOrganisation = await this.prisma.apiKey.findUnique({
       where: { fastHashedSecretKey: hash },
-      include: { project: { include: { organization: true } } },
+      include: {
+        project: { include: { organization: true } },
+        organization: true,
+      },
     });
 
     // add the key to redis for future use if available, this does not throw
     // only do so if the new hashkey exists already.
     if (apiKeyAndOrganisation && apiKeyAndOrganisation.fastHashedSecretKey) {
-      await this.addApiKeyToRedis(
-        hash,
-        convertToRedisRepresentation(apiKeyAndOrganisation),
+      const cachedApiKey = this.convertToRedisRepresentation(
+        apiKeyAndOrganisation,
       );
+      await this.addApiKeyToRedis(hash, cachedApiKey);
     }
     return apiKeyAndOrganisation
-      ? convertToRedisRepresentation(apiKeyAndOrganisation)
+      ? this.convertToRedisRepresentation(apiKeyAndOrganisation)
       : null;
   }
 
-  async addApiKeyToRedis(
+  private async addApiKeyToRedis(
     hash: string,
     newApiKey: z.infer<typeof OrgEnrichedApiKey> | typeof API_KEY_NON_EXISTENT,
   ) {
@@ -309,7 +366,7 @@ export class ApiAuthService {
 
     try {
       await this.redis.set(
-        this.createRedisKey(hash),
+        createApiKeyCacheKey(hash),
         JSON.stringify(newApiKey),
         "EX",
         env.LANGFUSE_CACHE_API_KEY_TTL_SECONDS, // redis API is in seconds
@@ -319,14 +376,14 @@ export class ApiAuthService {
     }
   }
 
-  async fetchApiKeyFromRedis(hash: string) {
+  private async fetchApiKeyFromRedis(hash: string) {
     if (!this.redis || env.LANGFUSE_CACHE_API_KEY_ENABLED !== "true") {
       return null;
     }
 
     try {
       const redisApiKey = await this.redis.getex(
-        this.createRedisKey(hash),
+        createApiKeyCacheKey(hash),
         "EX",
         env.LANGFUSE_CACHE_API_KEY_TTL_SECONDS, // redis API is in seconds
       );
@@ -346,7 +403,7 @@ export class ApiAuthService {
           "Failed to parse API key from Redis, deleting existing key from cache",
           parsedApiKey.error,
         );
-        await this.redis.del(this.createRedisKey(hash));
+        await this.redis.del(createApiKeyCacheKey(hash));
       }
       return null;
     } catch (error: unknown) {
@@ -355,47 +412,106 @@ export class ApiAuthService {
     }
   }
 
-  createRedisKey(hash: string) {
-    return `api-key:${hash}`;
-  }
-}
-
-export const convertToRedisRepresentation = (
-  apiKeyAndOrganisation: ApiKey & {
-    project: {
-      id: string;
+  private extractOrgIdAndCloudConfig(
+    apiKeyAndOrganisation: ApiKey & {
+      project: {
+        id: string;
+        organization: {
+          id: string;
+          name: string;
+          createdAt: Date;
+          updatedAt: Date;
+          cloudConfig: Prisma.JsonValue;
+          cloudFreeTierUsageThresholdState: string | null;
+        };
+      } | null;
+    } & {
       organization: {
         id: string;
         name: string;
         createdAt: Date;
         updatedAt: Date;
         cloudConfig: Prisma.JsonValue;
-      };
-    };
-  },
-) => {
-  const {
-    project: {
-      organization: { id: orgId, cloudConfig: cloudConfig },
+        cloudFreeTierUsageThresholdState: string | null;
+      } | null;
     },
-  } = apiKeyAndOrganisation;
+  ) {
+    const orgId =
+      apiKeyAndOrganisation.project?.organization.id ??
+      apiKeyAndOrganisation.organization?.id;
+    const rawCloudConfig =
+      apiKeyAndOrganisation.project?.organization.cloudConfig ??
+      apiKeyAndOrganisation.organization?.cloudConfig;
+    const cloudFreeTierUsageThresholdState =
+      apiKeyAndOrganisation.project?.organization
+        .cloudFreeTierUsageThresholdState ??
+      apiKeyAndOrganisation.organization?.cloudFreeTierUsageThresholdState;
 
-  const parsedCloudConfig = cloudConfig
-    ? CloudConfigSchema.parse(cloudConfig)
-    : undefined;
+    if (!orgId) {
+      logger.error(
+        `No organization found for key: ${apiKeyAndOrganisation.publicKey}`,
+      );
+      throw new Error("Invalid credentials: No organization found for key");
+    }
 
-  const newApiKey = OrgEnrichedApiKey.parse({
-    ...apiKeyAndOrganisation,
-    createdAt: apiKeyAndOrganisation.createdAt?.toISOString(),
-    orgId,
-    plan: getOrganizationPlanServerSide(parsedCloudConfig),
-    rateLimitOverrides: parsedCloudConfig?.rateLimitOverrides,
-  });
+    const cloudConfig = rawCloudConfig
+      ? CloudConfigSchema.parse(rawCloudConfig)
+      : undefined;
 
-  if (!orgId) {
-    logger.error("No organization found for key");
-    throw new Error("Invalid credentials");
+    return {
+      orgId,
+      cloudConfig,
+      cloudFreeTierUsageThresholdState,
+    };
   }
 
-  return newApiKey;
-};
+  /**
+   * Converts the API key and organization to a Redis representation.
+   * For project-scoped API keys, it includes the project ID and organization.
+   * For organization-scoped API keys, it includes only the organization.
+   * @param apiKeyAndOrganisation
+   */
+  private convertToRedisRepresentation(
+    apiKeyAndOrganisation: ApiKey & {
+      project: {
+        id: string;
+        organization: {
+          id: string;
+          name: string;
+          createdAt: Date;
+          updatedAt: Date;
+          cloudConfig: Prisma.JsonValue;
+          cloudFreeTierUsageThresholdState: string | null;
+        };
+      } | null;
+    } & {
+      organization: {
+        id: string;
+        name: string;
+        createdAt: Date;
+        updatedAt: Date;
+        cloudConfig: Prisma.JsonValue;
+        cloudFreeTierUsageThresholdState: string | null;
+      } | null;
+    },
+  ) {
+    const { orgId, cloudConfig, cloudFreeTierUsageThresholdState } =
+      this.extractOrgIdAndCloudConfig(apiKeyAndOrganisation);
+
+    const newApiKey = OrgEnrichedApiKey.parse({
+      ...apiKeyAndOrganisation,
+      createdAt: apiKeyAndOrganisation.createdAt?.toISOString(),
+      orgId,
+      plan: getOrganizationPlanServerSide(cloudConfig),
+      rateLimitOverrides: cloudConfig?.rateLimitOverrides,
+      isIngestionSuspended: cloudFreeTierUsageThresholdState === "BLOCKED",
+    });
+
+    if (!orgId) {
+      logger.error("No organization found for key");
+      throw new Error("Invalid credentials");
+    }
+
+    return newApiKey;
+  }
+}

@@ -1,6 +1,6 @@
 import { QueueName, TQueueJobTypes } from "../queues";
 import { Queue } from "bullmq";
-import { createNewRedisInstance, redisQueueRetryOptions } from "./redis";
+import { createBullMQQueueOptionsWithRedis } from "./redis";
 import { logger } from "../logger";
 
 export class ProjectDeleteQueue {
@@ -13,20 +13,19 @@ export class ProjectDeleteQueue {
   > | null {
     if (ProjectDeleteQueue.instance) return ProjectDeleteQueue.instance;
 
-    const newRedis = createNewRedisInstance({
-      enableOfflineQueue: false,
-      ...redisQueueRetryOptions,
-    });
-
-    ProjectDeleteQueue.instance = newRedis
+    const queueOptionsWithRedis = createBullMQQueueOptionsWithRedis(
+      QueueName.ProjectDelete,
+    );
+    ProjectDeleteQueue.instance = queueOptionsWithRedis
       ? new Queue<TQueueJobTypes[QueueName.ProjectDelete]>(
           QueueName.ProjectDelete,
           {
-            connection: newRedis,
+            ...queueOptionsWithRedis,
             defaultJobOptions: {
               removeOnComplete: true,
               removeOnFail: 100_000,
-              attempts: 5,
+              attempts: 10,
+              delay: 60_000, // 1 minute
               backoff: {
                 type: "exponential",
                 delay: 5000,

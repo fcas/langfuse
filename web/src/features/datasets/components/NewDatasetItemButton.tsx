@@ -1,5 +1,4 @@
-import { Button } from "@/src/components/ui/button";
-import { LockIcon, PlusIcon } from "lucide-react";
+import { PlusIcon } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -10,37 +9,30 @@ import { useState } from "react";
 import { NewDatasetItemForm } from "@/src/features/datasets/components/NewDatasetItemForm";
 import { DialogTrigger } from "@radix-ui/react-dialog";
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
-import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+import { ActionButton } from "@/src/components/ActionButton";
 
 export const NewDatasetItemButton = (props: {
   projectId: string;
   datasetId?: string;
-  className?: string;
 }) => {
   const [open, setOpen] = useState(false);
   const hasAccess = useHasProjectAccess({
     projectId: props.projectId,
     scope: "datasets:CUD",
   });
-  const capture = usePostHogClientCapture();
   return (
     <Dialog open={hasAccess && open} onOpenChange={setOpen}>
       <DialogTrigger asChild>
-        <Button
-          variant="secondary"
-          className={props.className}
-          disabled={!hasAccess}
-          onClick={() => capture("dataset_item:new_form_open")}
+        <ActionButton
+          variant="outline"
+          hasAccess={hasAccess}
+          trackingEventName="dataset_item:new_form_open"
+          icon={<PlusIcon className="h-4 w-4" aria-hidden="true" />}
         >
-          {hasAccess ? (
-            <PlusIcon className="-ml-0.5 mr-1.5 h-4 w-4" aria-hidden="true" />
-          ) : (
-            <LockIcon className="-ml-0.5 mr-1.5 h-3 w-3" aria-hidden="true" />
-          )}
           New item
-        </Button>
+        </ActionButton>
       </DialogTrigger>
-      <DialogContent className="h-[calc(100vh-5rem)] max-h-none w-[calc(100vw-5rem)] max-w-none items-start">
+      <DialogContent size="xl">
         <DialogHeader>
           <DialogTitle>Create new dataset item</DialogTitle>
         </DialogHeader>

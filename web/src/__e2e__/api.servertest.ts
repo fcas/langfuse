@@ -111,11 +111,14 @@ describe("Ingestion Pipeline", () => {
         expect(traceResponse.body).not.toBeNull();
         expect((await traceResponse.json()).id).toBe(traceId);
 
-        const trace = await getTraceById(traceId, projectId);
+        const trace = await getTraceById({ traceId, projectId });
         expect(trace).not.toBeNull();
         expect(trace?.name).toBe("test trace");
 
-        const observation = await getObservationById(spanId, projectId);
+        const observation = await getObservationById({
+          id: spanId,
+          projectId,
+        });
         expect(observation).not.toBeNull();
         expect(observation?.name).toBe("test span");
 
@@ -124,8 +127,21 @@ describe("Ingestion Pipeline", () => {
         expect(redis).not.toBeNull();
 
         const redisKeys = await redis?.keys(`api-key:*`);
-        expect(redisKeys?.length).toBe(1);
-        const redisValue = await redis?.get(redisKeys![0]);
+        expect(redisKeys?.length ?? 0).toBeGreaterThanOrEqual(1);
+        // Concurrent e2e tests may cache additional API keys — find the seed
+        // project's key by projectId rather than assuming it is the only one.
+        let redisValue: string | null | undefined = null;
+        for (const k of redisKeys ?? []) {
+          const v = await redis?.get(k);
+          if (!v) continue;
+          try {
+            if (JSON.parse(v).projectId === projectId) {
+              redisValue = v;
+              break;
+            }
+          } catch {}
+        }
+        expect(redisValue).not.toBeNull();
 
         const llmApiKey = OrgEnrichedApiKey.parse(JSON.parse(redisValue!));
         expect(llmApiKey.projectId).toBe(
@@ -295,13 +311,21 @@ describe("Prompts endpoint", () => {
 
     expect(validatedPrompt.name).toBe(promptName);
 
-    const redisKey = `prompt:7a88fb47-b4e2-43b8-a06c-a5ce950dc53a:${promptName}:${validatedPrompt.labels[0]}`;
-    const redisValue = await redis?.get(redisKey);
+    const pattern = `prompt:7a88fb47-b4e2-43b8-a06c-a5ce950dc53a:*:${promptName}:label:${validatedPrompt.labels[0]}`;
+    const keys = await redis?.keys(pattern);
+    expect(keys?.length).toBe(1);
+
+    const key = keys?.[0] as string;
+
+    const redisValue = await redis?.get(key);
 
     expect(redisValue).not.toBeNull();
     if (!redisValue) {
       return;
     }
-    expect(JSON.parse(redisValue)).toEqual(validatedPrompt);
+    expect(JSON.parse(redisValue)).toEqual({
+      ...validatedPrompt,
+      isActive: null, // deprecated isActive is being patched at the endpoint handler level; in Redis it is still null as in DB
+    });
   });
 });

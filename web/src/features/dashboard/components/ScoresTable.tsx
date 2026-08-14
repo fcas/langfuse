@@ -1,33 +1,45 @@
+/* eslint-disable @repo/no-style-props */
 import { DashboardCard } from "@/src/features/dashboard/components/cards/DashboardCard";
 import { DashboardTable } from "@/src/features/dashboard/components/cards/DashboardTable";
 import {
-  type ScoreDataType,
-  type ScoreSource,
+  type ScoreDataTypeType,
+  type ScoreSourceType,
   type FilterState,
 } from "@langfuse/shared";
+import { type ViewVersion } from "@langfuse/shared/query";
 import { api } from "@/src/utils/api";
 import { compactNumberFormatter } from "@/src/utils/numbers";
 import { RightAlignedCell } from "./RightAlignedCell";
 import { LeftAlignedCell } from "@/src/features/dashboard/components/LeftAlignedCell";
+import { cn } from "@/src/utils/tailwind";
 import { TotalMetric } from "./TotalMetric";
 import { createTracesTimeFilter } from "@/src/features/dashboard/lib/dashboard-utils";
-import { getScoreDataTypeIcon } from "@/src/features/scores/components/ScoreDetailColumnHelpers";
-import { isCategoricalDataType } from "@/src/features/scores/lib/helpers";
-import { type DatabaseRow } from "@/src/server/api/services/queryBuilder";
+import { getScoreDataTypeIcon } from "@/src/features/scores/lib/scoreColumns";
+import {
+  isBooleanDataType,
+  isCategoricalDataType,
+  isNumericDataType,
+} from "@/src/features/scores/lib/helpers";
+import { type DatabaseRow } from "@/src/server/api/services/sqlInterface";
 import { NoDataOrLoading } from "@/src/components/NoDataOrLoading";
-import { useClickhouse } from "@/src/components/layouts/ClickhouseAdminToggle";
 
 const dropValuesForCategoricalScores = (
   value: number,
-  scoreDataType: ScoreDataType,
+  scoreDataType: ScoreDataTypeType,
 ): string => {
-  return isCategoricalDataType(scoreDataType)
-    ? "-"
-    : compactNumberFormatter(value);
+  if (isCategoricalDataType(scoreDataType)) return "-";
+  if (isBooleanDataType(scoreDataType) || isNumericDataType(scoreDataType)) {
+    return compactNumberFormatter(value);
+  }
+  return "-";
 };
 
 const scoreNameSourceDataTypeMatch =
-  (scoreName: string, scoreSource: ScoreSource, scoreDataType: ScoreDataType) =>
+  (
+    scoreName: string,
+    scoreSource: ScoreSourceType,
+    scoreDataType: ScoreDataTypeType,
+  ) =>
   (item: DatabaseRow) =>
     item.scoreName === scoreName &&
     item.scoreSource === scoreSource &&
@@ -37,17 +49,20 @@ export const ScoresTable = ({
   className,
   projectId,
   globalFilterState,
+  isLoading = false,
+  metricsVersion,
 }: {
   className: string;
   projectId: string;
   globalFilterState: FilterState;
+  isLoading?: boolean;
+  metricsVersion?: ViewVersion;
 }) => {
   const localFilters = createTracesTimeFilter(
     globalFilterState,
     "scoreTimestamp",
   );
 
-  const useCh = useClickhouse();
   const metrics = api.dashboard.chart.useQuery(
     {
       projectId,
@@ -72,8 +87,8 @@ export const ScoresTable = ({
         },
       ],
       orderBy: [{ column: "scoreId", direction: "DESC", agg: "COUNT" }],
-      queryClickhouse: useCh,
       queryName: "score-aggregate",
+      version: metricsVersion ?? "v1",
     },
     {
       trpc: {
@@ -81,6 +96,7 @@ export const ScoresTable = ({
           skipBatch: true,
         },
       },
+      enabled: !isLoading,
     },
   );
 
@@ -116,8 +132,8 @@ export const ScoresTable = ({
           },
         ],
         orderBy: [{ column: "scoreId", direction: "DESC", agg: "COUNT" }],
-        queryClickhouse: useCh,
         queryName: "score-aggregate",
+        version: metricsVersion ?? "v1",
       },
       {
         trpc: {
@@ -125,13 +141,14 @@ export const ScoresTable = ({
             skipBatch: true,
           },
         },
+        enabled: !isLoading,
       },
     ),
   );
 
   if (!zeroValueScores || !oneValueScores) {
     return (
-      <DashboardCard title={"Scores"} isLoading={false}>
+      <DashboardCard title="Scores" isLoading={false}>
         <NoDataOrLoading isLoading={false} />
       </DashboardCard>
     );
@@ -143,8 +160,8 @@ export const ScoresTable = ({
 
     return metrics.data.map((metric) => {
       const scoreName = metric.scoreName as string;
-      const scoreSource = metric.scoreSource as ScoreSource;
-      const scoreDataType = metric.scoreDataType as ScoreDataType;
+      const scoreSource = metric.scoreSource as ScoreSourceType;
+      const scoreDataType = metric.scoreDataType as ScoreDataTypeType;
 
       const zeroValueScore = zeroValueScores.data.find(
         scoreNameSourceDataTypeMatch(scoreName, scoreSource, scoreDataType),
@@ -178,12 +195,17 @@ export const ScoresTable = ({
 
   return (
     <DashboardCard
-      className={className}
+      // h-full pins the card to the tile so the table fits its rows to the
+      // AVAILABLE height instead of overflowing; min-h-0 lets the flex column
+      // shrink so the row area scrolls internally. (LFE-11035)
+      className={cn(className, "h-full")}
+      cardContentClassName="min-h-0"
       title="Scores"
       isLoading={
-        metrics.isLoading ||
-        zeroValueScores.isLoading ||
-        oneValueScores.isLoading
+        isLoading ||
+        metrics.isPending ||
+        zeroValueScores.isPending ||
+        oneValueScores.isPending
       }
     >
       <DashboardTable
@@ -219,14 +241,15 @@ export const ScoresTable = ({
         ])}
         collapse={{ collapsed: 5, expanded: 20 }}
         isLoading={
-          metrics.isLoading ||
-          zeroValueScores.isLoading ||
-          oneValueScores.isLoading
+          isLoading ||
+          metrics.isPending ||
+          zeroValueScores.isPending ||
+          oneValueScores.isPending
         }
         noDataProps={{
           description:
             "Scores evaluate LLM quality and can be created manually or using the SDK.",
-          href: "https://langfuse.com/docs/scores",
+          href: "https://langfuse.com/docs/evaluation/overview",
         }}
       >
         <TotalMetric

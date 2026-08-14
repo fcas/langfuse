@@ -1,17 +1,33 @@
-import { FullScreenPage } from "@/src/components/layouts/full-screen-page";
-import Header from "@/src/components/layouts/header";
-import { TableWithMetadataWrapper } from "@/src/components/table/TableWithMetadataWrapper";
 import { Button } from "@/src/components/ui/button";
 import { JSONView } from "@/src/components/ui/CodeJsonViewer";
-import { DatasetRunItemsTable } from "@/src/features/datasets/components/DatasetRunItemsTable";
+import { DatasetRunItemsByRunTable } from "@/src/features/datasets/components/DatasetRunItemsByRunTable";
 import { DeleteDatasetRunButton } from "@/src/features/datasets/components/DeleteDatasetRunButton";
 import { DetailPageNav } from "@/src/features/navigate-detail-pages/DetailPageNav";
 import { api } from "@/src/utils/api";
-import { Columns3 } from "lucide-react";
+import { Columns3, MoreVertical } from "lucide-react";
 import Link from "next/link";
 import { useRouter } from "next/router";
+import { useEffect } from "react";
+import Page from "@/src/components/layouts/page";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "@/src/components/ui/dropdown-menu";
+import {
+  SidePanel,
+  SidePanelContent,
+  SidePanelHeader,
+  SidePanelTitle,
+} from "@/src/components/ui/side-panel";
+import { Skeleton } from "@/src/components/ui/skeleton";
+import { LocalIsoDate } from "@/src/components/LocalIsoDate";
+import { getDatasetBreadcrumb } from "@/src/features/datasets/utils/getDatasetBreadcrumb";
+import { useExperimentAccess } from "@/src/features/experiments/hooks/useExperimentAccess";
+import { singleRunToExperimentsUrl } from "@/src/features/experiments/utils/experimentUrlTranslation";
 
-export default function Dataset() {
+function DatasetRunLegacy() {
   const router = useRouter();
   const projectId = router.query.projectId as string;
   const datasetId = router.query.datasetId as string;
@@ -26,34 +42,26 @@ export default function Dataset() {
     projectId,
     runId,
   });
+  const breadcrumb = getDatasetBreadcrumb(
+    projectId,
+    datasetId,
+    dataset.data?.name,
+  );
 
   return (
-    <FullScreenPage>
-      <Header
-        title={`Dataset Run`}
-        breadcrumb={[
-          { name: "Datasets", href: `/project/${projectId}/datasets` },
+    <Page
+      headerProps={{
+        title: run.data?.name ?? runId,
+        itemType: "EXPERIMENT",
+        breadcrumb: [
+          ...breadcrumb,
           {
-            name: dataset.data?.name ?? datasetId,
-            href: `/project/${projectId}/datasets/${datasetId}`,
+            name: "Experiments",
+            href: `/project/${projectId}/datasets/${datasetId}/experiments`,
           },
-          { name: "Runs", href: `/project/${projectId}/datasets/${datasetId}` },
-          { name: run.data?.name ?? "" },
-        ]}
-        actionButtons={
+        ],
+        actionButtonsRight: (
           <>
-            <DeleteDatasetRunButton
-              projectId={projectId}
-              datasetRunId={runId}
-              redirectUrl={`/project/${projectId}/datasets/${datasetId}`}
-            />
-            <DetailPageNav
-              currentId={runId}
-              path={(entry) =>
-                `/project/${projectId}/datasets/${datasetId}/runs/${entry.id}`
-              }
-              listKey="datasetRuns"
-            />
             <Link
               href={{
                 pathname: `/project/${projectId}/datasets/${datasetId}/compare`,
@@ -65,47 +73,117 @@ export default function Dataset() {
                 <span>Compare</span>
               </Button>
             </Link>
-          </>
-        }
-      />
-      {run.data?.description || run.data?.metadata ? (
-        <TableWithMetadataWrapper
-          tableComponent={
-            <DatasetRunItemsTable
-              projectId={projectId}
-              datasetId={datasetId}
-              datasetRunId={runId}
+            <DetailPageNav
+              currentId={runId}
+              path={(entry) =>
+                `/project/${projectId}/datasets/${datasetId}/runs/${entry.id}`
+              }
+              listKey="datasetRuns"
             />
-          }
-          cardTitleChildren={
-            <span className="text-lg font-medium">Run details</span>
-          }
-          cardContentChildren={
-            <div className="grid h-full grid-cols-1 gap-2 overflow-hidden">
-              {!!run.data?.description && (
-                <JSONView
-                  json={run.data.description}
-                  title="Description"
-                  className="overflow-y-auto"
-                />
-              )}
-              {!!run.data?.metadata && (
-                <JSONView
-                  json={run.data.metadata}
-                  title="Metadata"
-                  className="overflow-y-auto"
-                />
-              )}
-            </div>
-          }
-        />
-      ) : (
-        <DatasetRunItemsTable
-          projectId={projectId}
-          datasetId={datasetId}
-          datasetRunId={runId}
-        />
-      )}
-    </FullScreenPage>
+            <DropdownMenu>
+              <DropdownMenuTrigger asChild>
+                <Button variant="outline" size="icon">
+                  <MoreVertical className="h-4 w-4" />
+                </Button>
+              </DropdownMenuTrigger>
+              <DropdownMenuContent>
+                <DropdownMenuItem asChild>
+                  <DeleteDatasetRunButton
+                    projectId={projectId}
+                    datasetRunId={runId}
+                    datasetId={datasetId}
+                    redirectUrl={`/project/${projectId}/datasets/${datasetId}/experiments`}
+                  />
+                </DropdownMenuItem>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          </>
+        ),
+      }}
+    >
+      <div className="grid flex-1 grid-cols-[1fr_auto] overflow-hidden">
+        <div className="flex h-full flex-col overflow-hidden">
+          <DatasetRunItemsByRunTable
+            projectId={projectId}
+            datasetId={datasetId}
+            datasetRunId={runId}
+            datasetVersion={run.data?.datasetVersion}
+          />
+        </div>
+        <SidePanel
+          mobileTitle="Experiment run details"
+          id="experiment-run-details"
+        >
+          <SidePanelHeader>
+            <SidePanelTitle>Experiment run details</SidePanelTitle>
+          </SidePanelHeader>
+          <SidePanelContent>
+            {run.isPending ? (
+              <Skeleton className="h-full w-full" />
+            ) : (
+              <>
+                {run.data?.datasetVersion && (
+                  <div className="flex flex-col gap-2 p-1">
+                    <span className="text-sm font-bold">Dataset Version</span>
+                    <Link
+                      href={`/project/${projectId}/datasets/${datasetId}/items?version=${run.data.datasetVersion.toISOString()}`}
+                      className="text-link hover:text-link-hover text-sm"
+                    >
+                      <LocalIsoDate date={run.data.datasetVersion} />
+                    </Link>
+                  </div>
+                )}
+                {!!run.data?.description && (
+                  <JSONView
+                    json={run.data.description}
+                    title="Description"
+                    className="w-full overflow-y-auto"
+                  />
+                )}
+                {!!run.data?.metadata && (
+                  <JSONView
+                    json={run.data.metadata}
+                    title="Metadata"
+                    className="w-full overflow-y-auto"
+                  />
+                )}
+                {!run.data?.description && !run.data?.metadata && (
+                  <div className="text-muted-foreground mt-1 px-1 text-sm">
+                    No description or metadata for this run
+                  </div>
+                )}
+              </>
+            )}
+          </SidePanelContent>
+        </SidePanel>
+      </div>
+    </Page>
   );
+}
+
+export default function DatasetRun() {
+  const router = useRouter();
+  const projectId = router.query.projectId as string;
+  const runId = router.query.runId as string;
+  const { isExperimentsBetaActive, isInitializing } = useExperimentAccess();
+
+  useEffect(() => {
+    if (
+      !router.isReady ||
+      isInitializing ||
+      !isExperimentsBetaActive ||
+      !projectId ||
+      !runId
+    ) {
+      return;
+    }
+
+    router.replace(singleRunToExperimentsUrl(projectId, runId));
+  }, [isExperimentsBetaActive, isInitializing, projectId, router, runId]);
+
+  if (!router.isReady || isInitializing || isExperimentsBetaActive) {
+    return <Skeleton className="h-full w-full" />;
+  }
+
+  return <DatasetRunLegacy />;
 }

@@ -1,6 +1,5 @@
+/* eslint-disable @repo/no-abstracted-overlay-trigger */
 import { PlusIcon } from "lucide-react";
-import { useState } from "react";
-
 import { Button } from "@/src/components/ui/button";
 import {
   Dialog,
@@ -15,12 +14,22 @@ import { useUiCustomization } from "@/src/ee/features/ui-customization/useUiCust
 import { CreateLLMApiKeyForm } from "@/src/features/public-api/components/CreateLLMApiKeyForm";
 
 export function CreateLLMApiKeyDialog({
-  evalModelsOnly,
+  open,
+  setOpen,
+  hideTrigger = false,
 }: {
-  evalModelsOnly?: boolean;
+  open: boolean;
+  setOpen: (open: boolean) => void;
+  /**
+   * Hide the built-in "Add LLM Connection" trigger button and render only the
+   * (controlled) dialog. Use this when the dialog is opened from elsewhere — e.g.
+   * from inside a Select/dropdown, where the dialog must live OUTSIDE the
+   * dropdown content so it survives the dropdown closing. See the overlay
+   * lifecycle note in web/AGENTS.md.
+   */
+  hideTrigger?: boolean;
 }) {
   const projectId = useProjectIdFromURL();
-  const [open, setOpen] = useState(false);
   const hasAccess = useHasProjectAccess({
     projectId,
     scope: "llmApiKeys:create",
@@ -36,20 +45,21 @@ export function CreateLLMApiKeyDialog({
         setOpen(isOpen);
       }}
     >
-      <DialogTrigger asChild>
-        <Button variant="secondary">
-          <PlusIcon className="-ml-0.5 mr-1.5 h-5 w-5" aria-hidden="true" />
-          Add new LLM API key
-        </Button>
-      </DialogTrigger>
+      {!hideTrigger && (
+        <DialogTrigger asChild>
+          <Button variant="secondary">
+            <PlusIcon className="mr-1.5 -ml-0.5 h-5 w-5" aria-hidden="true" />
+            Add LLM Connection
+          </Button>
+        </DialogTrigger>
+      )}
       <DialogContent className="max-h-[90%] min-w-[40vw] overflow-auto">
         <DialogHeader>
-          <DialogTitle>Add new LLM API key</DialogTitle>
+          <DialogTitle>New LLM Connection</DialogTitle>
         </DialogHeader>
         {open && (
           <CreateLLMApiKeyForm
             projectId={projectId}
-            evalModelsOnly={evalModelsOnly}
             onSuccess={() => setOpen(false)}
             customization={uiCustomization}
           />

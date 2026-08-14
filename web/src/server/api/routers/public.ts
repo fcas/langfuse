@@ -1,73 +1,32 @@
 import { VERSION } from "@/src/constants/VERSION";
 import { env } from "@/src/env.mjs";
-import { createTRPCRouter, publicProcedure } from "@/src/server/api/trpc";
-import { logger } from "@langfuse/shared/src/server";
-import { TRPCError } from "@trpc/server";
+import {
+  createTRPCRouter,
+  protectedProjectProcedure,
+  publicProcedure,
+} from "@/src/server/api/trpc";
+import { logger, compareVersions } from "@langfuse/shared/src/server";
 import { z } from "zod";
-
-const versionSchema = z.string().regex(/^v\d+\.\d+\.\d+(?:[-+].+)?$/); // e.g. v1.2.3, v1.2.3-rc.1, v1.2.3+build.123
-
-const compareVersions = (
-  current: string,
-  latest: string,
-): "major" | "minor" | "patch" | null => {
-  const currentValidated = versionSchema.parse(current);
-  const latestValidated = versionSchema.parse(latest);
-
-  const parseVersion = (version: string) => {
-    if (version.startsWith("v")) {
-      version = version.slice(1);
-    }
-    // Split into version and pre-release parts
-    const [versionPart, ...rest] = version.split(/[-+]/);
-    const numbers = versionPart.split(".").map(Number);
-    return {
-      numbers,
-      isPreRelease: rest.length > 0,
-    };
-  };
-
-  const current_parsed = parseVersion(currentValidated);
-  const latest_parsed = parseVersion(latestValidated);
-
-  const [currentMajor, currentMinor, currentPatch] = current_parsed.numbers;
-  const [latestMajor, latestMinor, latestPatch] = latest_parsed.numbers;
-
-  // If current is a pre-release (RC) and latest is a full release of the same version,
-  // consider it as needing a patch update
-  if (
-    current_parsed.isPreRelease &&
-    !latest_parsed.isPreRelease &&
-    currentMajor === latestMajor &&
-    currentMinor === latestMinor &&
-    currentPatch === latestPatch
-  ) {
-    return "patch";
-  }
-
-  if (latestMajor > currentMajor) return "major";
-  if (latestMajor === currentMajor && latestMinor > currentMinor)
-    return "minor";
-  if (
-    latestMajor === currentMajor &&
-    latestMinor === currentMinor &&
-    latestPatch > currentPatch
-  )
-    return "patch";
-
-  return null;
-};
 
 const ReleaseApiRes = z.array(
   z.object({
     repo: z.string(),
     latestRelease: z.string(),
-    publishedAt: z.string().datetime(),
-    url: z.string().url(),
+    publishedAt: z.iso.datetime(),
+    url: z.url(),
   }),
 );
 
 export const publicRouter = createTRPCRouter({
+  traceReadConfig: publicProcedure.query(() => ({
+    v4WriteMode: env.LANGFUSE_MIGRATION_V4_WRITE_MODE,
+  })),
+  tracingSearchConfig: protectedProjectProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(() => ({
+      legacyTracingIoSearchEnabled:
+        env.LANGFUSE_DISABLE_LEGACY_TRACING_IO_SEARCH !== "true",
+    })),
   checkUpdate: publicProcedure.query(async () => {
     // Skip update check on Langfuse Cloud
     if (env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION) return null;
@@ -79,27 +38,33 @@ export const publicRouter = createTRPCRouter({
       );
       body = await response.json();
     } catch (error) {
-      logger.info(
+      logger.error(
         "[trpc.public.checkUpdate] failed to fetch latest-release api",
+        {
+          error,
+        },
       );
       return null;
     }
 
     const releases = ReleaseApiRes.safeParse(body);
     if (!releases.success) {
-      throw new TRPCError({
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Release API response is invalid",
-      });
+      logger.error(
+        "[trpc.public.checkUpdate] Release API response is invalid, does not match schema",
+        {
+          error: releases.error,
+        },
+      );
+      return null;
     }
     const langfuseRelease = releases.data.find(
       (release) => release.repo === "langfuse/langfuse",
     );
     if (!langfuseRelease) {
-      throw new TRPCError({
-        code: "INTERNAL_SERVER_ERROR",
-        message: "Release API response is invalid",
-      });
+      logger.error(
+        "[trpc.public.checkUpdate] Release API response is invalid, does not contain langfuse/langfuse",
+      );
+      return null;
     }
 
     const updateType = compareVersions(VERSION, langfuseRelease.latestRelease);

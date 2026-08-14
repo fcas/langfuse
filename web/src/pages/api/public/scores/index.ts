@@ -1,43 +1,51 @@
-import { v4 } from "uuid";
-
-import { createAuthedAPIRoute } from "@/src/features/public-api/server/createAuthedAPIRoute";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
 import {
-  GetScoresQuery,
-  GetScoresResponse,
-  legacyFilterAndValidateV1GetScoreList,
-  PostScoresBody,
-  PostScoresResponse,
+  GetScoresQueryV1,
+  GetScoresResponseV1,
+  filterAndValidateLegacyV1GetScoreList,
+  PostScoresBodyV1,
+  PostScoresResponseV1,
 } from "@langfuse/shared";
-import { prisma, Prisma } from "@langfuse/shared/src/db";
 import {
-  eventTypes,
+  createIngestionAttribution,
   logger,
-  processEventBatch,
 } from "@langfuse/shared/src/server";
-import { tokenCount } from "@/src/features/ingest/usage";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
-import {
-  generateScoresForPublicApi,
-  getScoresCountForPublicApi,
-} from "@/src/features/public-api/server/scores";
+import { ForbiddenError } from "@langfuse/shared";
+import { ScoresApiService } from "@/src/features/public-api/server/scores-api-service";
+import { SCORES_DEPRECATION } from "@/src/features/public-api/server/deprecations";
+import { randomUUID } from "crypto";
 
 export default withMiddlewares({
-  POST: createAuthedAPIRoute({
+  POST: createAuthedProjectAPIRoute({
     name: "Create Score",
-    bodySchema: PostScoresBody,
-    responseSchema: PostScoresResponse,
-    fn: async ({ body, auth, res }) => {
-      const event = {
-        id: v4(),
-        type: eventTypes.SCORE_CREATE,
-        timestamp: new Date().toISOString(),
-        body,
-      };
-      if (!event.body.id) {
-        event.body.id = v4();
+    bodySchema: PostScoresBodyV1,
+    responseSchema: PostScoresResponseV1,
+    allowedAccessLevels: ["project", "scores"],
+    fn: async ({ body, auth, req, res }) => {
+      if (auth.scope.isIngestionSuspended) {
+        throw new ForbiddenError(
+          "Ingestion suspended: Usage threshold exceeded. Please upgrade your plan.",
+        );
       }
-      const result = await processEventBatch([event], auth, tokenCount);
+
+      const conformedBody = {
+        ...body,
+        // We previously used `if(!body.id)` to decide if a new ID should be generated,
+        // this would accept falsy values such as empty string as valid IDs, and generate a new ID in that case.
+        // The `createScore` uses `??` instead, which would break this behavior, so we use `||` here to maintain the old behavior.
+        id: body.id || randomUUID(),
+      };
+
+      const scoresApiService = new ScoresApiService("v1");
+      const { id, result } = await scoresApiService.createScore({
+        body: conformedBody,
+        auth,
+        attribution: createIngestionAttribution({
+          headers: req.headers,
+          authCheck: auth,
+        }),
+      });
       if (result.errors.length > 0) {
         const error = result.errors[0];
         res
@@ -49,201 +57,55 @@ export default withMiddlewares({
         logger.error("Failed to create score", { result });
         throw new Error("Failed to create score");
       }
-      return { id: event.body.id };
+      return { id };
     },
   }),
-  GET: createAuthedAPIRoute({
+  GET: createAuthedProjectAPIRoute({
     name: "/api/public/scores",
-    querySchema: GetScoresQuery,
-    responseSchema: GetScoresResponse,
+    querySchema: GetScoresQueryV1,
+    responseSchema: GetScoresResponseV1,
+    deprecation: SCORES_DEPRECATION,
+    rejectInEventsOnlyMode: true,
     fn: async ({ query, auth }) => {
-      const {
-        page,
-        limit,
-        configId,
-        queueId,
-        traceTags,
-        userId,
-        name,
-        fromTimestamp,
-        toTimestamp,
-        source,
-        operator,
-        value,
-        scoreIds,
-        dataType,
-      } = query;
+      const scoresApiService = new ScoresApiService("v1");
 
-      return await measureAndReturnApi({
-        input: { projectId: auth.scope.projectId, queryClickhouse: false },
-        operation: "api/public/scores",
-        user: null,
-        pgExecution: async () => {
-          const skipValue = (page - 1) * limit;
-          const configCondition = configId
-            ? Prisma.sql`AND s."config_id" = ${configId}`
-            : Prisma.empty;
-          const queueCondition = queueId
-            ? Prisma.sql`AND s."queue_id" = ${queueId}`
-            : Prisma.empty;
-          const traceTagsCondition = traceTags
-            ? Prisma.sql`AND ARRAY[${Prisma.join(
-                (Array.isArray(traceTags)
-                  ? traceTags
-                  : traceTags.split(",")
-                ).map((v) => Prisma.sql`${v}`),
-                ", ",
-              )}] <@ t."tags"`
-            : Prisma.empty;
-          const dataTypeCondition = dataType
-            ? Prisma.sql`AND s."data_type" = ${dataType}::"ScoreDataType"`
-            : Prisma.empty;
-          const userCondition = userId
-            ? Prisma.sql`AND t."user_id" = ${userId}`
-            : Prisma.empty;
-          const nameCondition = name
-            ? Prisma.sql`AND s."name" = ${name}`
-            : Prisma.empty;
-          const fromTimestampCondition = fromTimestamp
-            ? Prisma.sql`AND s."timestamp" >= ${fromTimestamp}::timestamp with time zone at time zone 'UTC'`
-            : Prisma.empty;
-          const toTimestampCondition = toTimestamp
-            ? Prisma.sql`AND s."timestamp" < ${toTimestamp}::timestamp with time zone at time zone 'UTC'`
-            : Prisma.empty;
-          const sourceCondition = source
-            ? Prisma.sql`AND s."source" = ${source}::"ScoreSource"`
-            : Prisma.empty;
-          const valueCondition =
-            operator && value !== null && value !== undefined
-              ? Prisma.sql`AND s."value" ${Prisma.raw(`${operator}`)} ${value}`
-              : Prisma.empty;
-          const scoreIdCondition = scoreIds
-            ? Prisma.sql`AND s."id" = ANY(${scoreIds})`
-            : Prisma.empty;
+      const scoreParams = {
+        projectId: auth.scope.projectId,
+        page: query.page ?? undefined,
+        limit: query.limit ?? undefined,
+        userId: query.userId ?? undefined,
+        name: query.name ?? undefined,
+        configId: query.configId ?? undefined,
+        queueId: query.queueId ?? undefined,
+        traceTags: query.traceTags ?? undefined,
+        dataType: query.dataType ?? undefined,
+        fromTimestamp: query.fromTimestamp ?? undefined,
+        toTimestamp: query.toTimestamp ?? undefined,
+        environment: query.environment ?? undefined,
+        source: query.source ?? undefined,
+        value: query.value ?? undefined,
+        operator: query.operator ?? undefined,
+        scoreIds: query.scoreIds ?? undefined,
+        advancedFilters: query.filter,
+      };
+      const [items, count] = await Promise.all([
+        scoresApiService.generateScoresForPublicApi(scoreParams),
+        scoresApiService.getScoresCountForPublicApi(scoreParams),
+      ]);
 
-          const scores = await prisma.$queryRaw<Array<unknown>>(Prisma.sql`
-            SELECT
-              s.id,
-              s.timestamp,
-              s.name,
-              s.value,
-              s.string_value as "stringValue",
-              s.author_user_id as "authorUserId",
-              s.project_id as "projectId",
-              s.created_at as "createdAt",  
-              s.updated_at as "updatedAt",  
-              s.source,
-              s.comment,
-              s.data_type as "dataType",
-              s.config_id as "configId",
-              s.queue_id as "queueId",
-              s.trace_id as "traceId",
-              s.observation_id as "observationId",
-              json_build_object('userId', t.user_id, 'tags', t.tags) as "trace"
-            FROM "scores" AS s
-            LEFT JOIN "traces" AS t ON t.id = s.trace_id AND t.project_id = ${auth.scope.projectId}
-            WHERE s.project_id = ${auth.scope.projectId}
-            ${configCondition}
-            ${queueCondition}
-            ${traceTagsCondition}
-            ${dataTypeCondition}
-            ${userCondition}
-            ${nameCondition}
-            ${sourceCondition}
-            ${fromTimestampCondition}
-            ${toTimestampCondition}
-            ${valueCondition}
-            ${scoreIdCondition}
-            ORDER BY s."timestamp" DESC
-            LIMIT ${limit} OFFSET ${skipValue}
-          `);
+      const finalCount = count ? count : 0;
 
-          const totalItemsRes = await prisma.$queryRaw<{ count: bigint }[]>(
-            Prisma.sql`
-              SELECT COUNT(*) as count
-              FROM "scores" AS s
-              LEFT JOIN "traces" AS t ON t.id = s.trace_id AND t.project_id = ${auth.scope.projectId}
-              WHERE s.project_id = ${auth.scope.projectId}
-              ${configCondition}
-              ${queueCondition}
-              ${traceTagsCondition}
-              ${dataTypeCondition}
-              ${userCondition}
-              ${nameCondition}
-              ${sourceCondition}
-              ${fromTimestampCondition}
-              ${toTimestampCondition}
-              ${valueCondition}
-              ${scoreIdCondition}
-            `,
-          );
-
-          const validatedScores = legacyFilterAndValidateV1GetScoreList(scores);
-
-          const totalItems =
-            totalItemsRes[0] !== undefined ? Number(totalItemsRes[0].count) : 0;
-
-          return {
-            data: validatedScores,
-            meta: {
-              page: page,
-              limit: limit,
-              totalItems,
-              totalPages: Math.ceil(totalItems / limit),
-            },
-          };
+      return {
+        // As these are traces scores, we expect all scores to have a traceId set
+        // For type consistency, we validate the scores against the v1 schema which requires a traceId
+        data: filterAndValidateLegacyV1GetScoreList(items),
+        meta: {
+          page: query.page,
+          limit: query.limit,
+          totalItems: finalCount,
+          totalPages: Math.ceil(finalCount / query.limit),
         },
-        clickhouseExecution: async () => {
-          const [items, count] = await Promise.all([
-            generateScoresForPublicApi({
-              projectId: auth.scope.projectId,
-              page: query.page ?? undefined,
-              limit: query.limit ?? undefined,
-              userId: query.userId ?? undefined,
-              name: query.name ?? undefined,
-              configId: query.configId ?? undefined,
-              queueId: query.queueId ?? undefined,
-              traceTags: query.traceTags ?? undefined,
-              dataType: query.dataType ?? undefined,
-              fromTimestamp: query.fromTimestamp ?? undefined,
-              toTimestamp: query.toTimestamp ?? undefined,
-              source: query.source ?? undefined,
-              value: query.value ?? undefined,
-              operator: query.operator ?? undefined,
-              scoreIds: query.scoreIds ?? undefined,
-            }),
-            getScoresCountForPublicApi({
-              projectId: auth.scope.projectId,
-              page: query.page ?? undefined,
-              limit: query.limit ?? undefined,
-              userId: query.userId ?? undefined,
-              name: query.name ?? undefined,
-              configId: query.configId ?? undefined,
-              queueId: query.queueId ?? undefined,
-              traceTags: query.traceTags ?? undefined,
-              dataType: query.dataType ?? undefined,
-              fromTimestamp: query.fromTimestamp ?? undefined,
-              toTimestamp: query.toTimestamp ?? undefined,
-              source: query.source ?? undefined,
-              value: query.value ?? undefined,
-              operator: query.operator ?? undefined,
-              scoreIds: query.scoreIds ?? undefined,
-            }),
-          ]);
-
-          const finalCount = count ? count : 0;
-
-          return {
-            data: legacyFilterAndValidateV1GetScoreList(items),
-            meta: {
-              page: query.page,
-              limit: query.limit,
-              totalItems: finalCount,
-              totalPages: Math.ceil(finalCount / query.limit),
-            },
-          };
-        },
-      });
+      };
     },
   }),
 });

@@ -1,5 +1,10 @@
-import { ObservationLevel } from "@prisma/client";
-import { ColumnDefinition, OptionsDefinition } from "..";
+import {
+  type ColumnDefinition,
+  type MultiValueOption,
+  type ObservationLevelType,
+  type SingleValueOption,
+} from "..";
+import { formatColumnOptions } from "./typeHelpers";
 
 export const tracesOnlyCols: ColumnDefinition[] = [
   {
@@ -11,11 +16,19 @@ export const tracesOnlyCols: ColumnDefinition[] = [
   { name: "ID", id: "id", type: "string", internal: "t.id" },
   {
     name: "Name",
-    id: "name",
+    id: "traceName",
     type: "stringOptions",
     internal: 't."name"',
     options: [], // to be filled in at runtime
     nullable: true,
+    aliases: ["name"],
+  },
+  {
+    name: "Environment",
+    id: "environment",
+    type: "stringOptions",
+    internal: 't."environment"',
+    options: [], // to be filled in at runtime
   },
   {
     name: "Timestamp",
@@ -62,14 +75,20 @@ export const tracesOnlyCols: ColumnDefinition[] = [
     id: "level",
     type: "stringOptions",
     internal: '"level"',
-    options: Object.values(ObservationLevel).map((value) => ({ value })),
+    options: [
+      { value: "DEBUG" },
+      { value: "DEFAULT" },
+      { value: "WARNING" },
+      { value: "ERROR" },
+    ] as { value: ObservationLevelType }[],
   },
   {
     name: "Tags",
-    id: "tags",
+    id: "traceTags",
     type: "arrayOptions",
     internal: 't."tags"',
     options: [], // to be filled in at runtime
+    aliases: ["tags"],
   },
 ];
 export const tracesTableCols: ColumnDefinition[] = [
@@ -89,6 +108,30 @@ export const tracesTableCols: ColumnDefinition[] = [
     nullable: true,
   },
   {
+    name: "Error Level Count",
+    id: "errorCount",
+    type: "number",
+    internal: 'generation_metrics."errorCount"',
+  },
+  {
+    name: "Warning Level Count",
+    id: "warningCount",
+    type: "number",
+    internal: 'generation_metrics."warningCount"',
+  },
+  {
+    name: "Default Level Count",
+    id: "defaultCount",
+    type: "number",
+    internal: 'generation_metrics."defaultCount"',
+  },
+  {
+    name: "Debug Level Count",
+    id: "debugCount",
+    type: "number",
+    internal: 'generation_metrics."debugCount"',
+  },
+  {
     name: "Total Tokens",
     id: "totalTokens",
     type: "number",
@@ -96,18 +139,32 @@ export const tracesTableCols: ColumnDefinition[] = [
     nullable: true,
   },
   {
-    name: "Usage",
-    id: "usage",
+    name: "Tokens",
+    id: "tokens",
     type: "number",
     internal: 'generation_metrics."totalTokens"',
     nullable: true,
   },
-
   {
-    name: "Scores",
+    name: "Scores (numeric)",
     id: "scores_avg",
     type: "numberObject",
     internal: "scores_avg",
+  },
+  {
+    name: "Scores (categorical)",
+    id: "score_categories",
+    type: "categoryOptions",
+    internal: "score_categories",
+    options: [], // to be filled in at runtime
+    nullable: true,
+  },
+  {
+    name: "Scores (boolean)",
+    id: "score_booleans",
+    type: "booleanObject",
+    internal: "score_booleans",
+    nullable: true,
   },
   {
     name: "Latency (s)",
@@ -136,6 +193,18 @@ export const tracesTableCols: ColumnDefinition[] = [
     internal: '"calculatedTotalCost"',
     nullable: true,
   },
+  {
+    name: "Comment Count",
+    id: "commentCount",
+    type: "number",
+    internal: "", // handled by comment filter helpers
+  },
+  {
+    name: "Comment Content",
+    id: "commentContent",
+    type: "string",
+    internal: "", // handled by comment filter helpers
+  },
 ];
 
 export const datasetCol: ColumnDefinition = {
@@ -149,15 +218,21 @@ export const datasetCol: ColumnDefinition = {
 // Used only for dataset evaluator, not on dataset table
 export const datasetOnlyCols: ColumnDefinition[] = [datasetCol];
 
+/** @alias */
 export const evalTraceTableCols: ColumnDefinition[] = tracesOnlyCols;
+/** @alias */
 export const evalDatasetFormFilterCols: ColumnDefinition[] = datasetOnlyCols;
+
 export type TraceOptions = {
-  scores_avg: Array<string>;
-  name: Array<OptionsDefinition>;
-  tags: Array<OptionsDefinition>;
+  scores_avg?: Array<string>;
+  score_categories?: Array<MultiValueOption>;
+  score_booleans?: Array<string>;
+  traceName?: Array<SingleValueOption>;
+  traceTags?: Array<SingleValueOption>;
+  environment?: Array<SingleValueOption>;
 };
 export type DatasetOptions = {
-  datasetId: Array<OptionsDefinition>;
+  datasetId: Array<SingleValueOption>;
 };
 
 // Used only for dataset evaluator, not on dataset table
@@ -167,7 +242,7 @@ export function datasetFormFilterColsWithOptions(
 ): ColumnDefinition[] {
   return cols.map((col) => {
     if (col.id === "datasetId") {
-      return { ...col, options: options?.datasetId ?? [] };
+      return formatColumnOptions(col, options?.datasetId ?? []);
     }
     return col;
   });
@@ -179,13 +254,22 @@ export function tracesTableColsWithOptions(
 ): ColumnDefinition[] {
   return cols.map((col) => {
     if (col.id === "scores_avg") {
-      return { ...col, keyOptions: options?.scores_avg ?? [] };
+      return formatColumnOptions(col, options?.scores_avg ?? []);
     }
-    if (col.id === "name") {
-      return { ...col, options: options?.name ?? [] };
+    if (col.id === "traceName") {
+      return formatColumnOptions(col, options?.traceName ?? []);
     }
-    if (col.id === "tags") {
-      return { ...col, options: options?.tags ?? [] };
+    if (col.id === "traceTags") {
+      return formatColumnOptions(col, options?.traceTags ?? []);
+    }
+    if (col.id === "environment") {
+      return formatColumnOptions(col, options?.environment ?? []);
+    }
+    if (col.id === "score_categories") {
+      return formatColumnOptions(col, options?.score_categories ?? []);
+    }
+    if (col.id === "score_booleans") {
+      return formatColumnOptions(col, options?.score_booleans ?? []);
     }
     return col;
   });

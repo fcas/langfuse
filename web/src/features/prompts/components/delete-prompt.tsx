@@ -1,3 +1,4 @@
+/* eslint-disable @repo/no-abstracted-overlay-trigger */
 import { Button } from "@/src/components/ui/button";
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
 import { api } from "@/src/utils/api";
@@ -14,11 +15,17 @@ export function DeletePrompt({ promptName }: { promptName: string }) {
   const projectId = useProjectIdFromURL();
   const utils = api.useUtils();
   const [isOpen, setIsOpen] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const hasAccess = useHasProjectAccess({ projectId, scope: "prompts:CUD" });
 
   const mutDeletePrompt = api.prompts.delete.useMutation({
     onSuccess: () => {
-      void utils.prompts.invalidate();
+      utils.prompts.invalidate();
+      setError(null);
+      setIsOpen(false);
+    },
+    onError: (error) => {
+      setError(error.message);
     },
   });
 
@@ -30,31 +37,37 @@ export function DeletePrompt({ promptName }: { promptName: string }) {
         </Button>
       </PopoverTrigger>
       <PopoverContent>
-        <h2 className="text-md mb-3 font-semibold">Please confirm</h2>
+        <h2 className="mb-3 font-bold">Please confirm</h2>
         <p className="mb-3 text-sm">
           This action permanently deletes this prompt. All requests to fetch
           prompt{" "}
-          <code className="relative rounded bg-muted px-[0.3rem] py-[0.2rem] font-mono text-sm font-semibold">
+          <code className="bg-muted relative rounded px-[0.3rem] py-[0.2rem] font-mono text-sm font-bold">
             {promptName}
           </code>{" "}
           will error.
         </p>
+        {error && (
+          <div className="mb-3 rounded border border-red-200 bg-red-50 p-3 text-sm text-red-700">
+            <p className="font-bold">Error:</p>
+            <p className="whitespace-pre-wrap">{error}</p>
+          </div>
+        )}
         <div className="flex justify-end space-x-4">
           <Button
             type="button"
             variant="destructive"
-            loading={mutDeletePrompt.isLoading}
+            loading={mutDeletePrompt.isPending}
             onClick={() => {
               if (!projectId) {
                 console.error("Project ID is missing");
                 return;
               }
+              setError(null);
 
-              void mutDeletePrompt.mutateAsync({
+              mutDeletePrompt.mutate({
                 projectId,
                 promptName,
               });
-              setIsOpen(false);
             }}
           >
             Delete Prompt

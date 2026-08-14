@@ -1,39 +1,49 @@
 import { randomUUID } from "crypto";
 import { z } from "zod";
 
-import { type Model } from "../../db";
 import { env } from "../../env";
 import {
   InvalidRequestError,
   LangfuseNotFoundError,
   UnauthorizedError,
 } from "../../errors";
-import { AuthHeaderValidVerificationResult } from "../auth/types";
-import { getClickhouseEntityType } from "../clickhouse/schemaUtils";
+import { AuthHeaderValidVerificationResultIngestion } from "../auth/types";
+import {
+  getClickhouseEntityType,
+  type IngestionEntityTypes,
+} from "../clickhouse/schemaUtils";
 import {
   getCurrentSpan,
   instrumentAsync,
-  instrumentSync,
+  recordDistribution,
   recordIncrement,
-  traceException,
 } from "../instrumentation";
 import { logger } from "../logger";
-import { LegacyIngestionEventType, QueueJobs } from "../queues";
+import { QueueJobs } from "../queues";
 import { IngestionQueue } from "../redis/ingestionQueue";
-import { LegacyIngestionQueue } from "../redis/legacyIngestion";
 import { redis } from "../redis/redis";
-import { handleBatch } from "./legacy";
+import {
+  eventTypes,
+  createIngestionEventSchema,
+  IngestionEventType,
+} from "./types";
+import type { IngestionAttribution } from "./ingestionAttribution";
 import {
   StorageService,
   StorageServiceFactory,
 } from "../services/StorageService";
-import { getProcessorForEvent } from "./legacy/EventProcessor";
-import { eventTypes, ingestionEvent, IngestionEventType } from "./types";
-
-export type TokenCountDelegate = (p: {
-  model: Model;
-  text: unknown;
-}) => number | undefined;
+import {
+  HASH_HEX_LENGTH,
+  safeBlobFilenameStem,
+  safeBlobKeySegment,
+} from "../services/safeBlobKeySegment";
+import { buildEventBucketPrefix } from "./eventBucketPath";
+import { isTraceIdInSample } from "./sampling";
+import {
+  isS3SlowDownError,
+  markProjectS3Slowdown,
+} from "../redis/s3SlowdownTracking";
+import { markProjectIngestFailure } from "../redis/ingestionFailureTracking";
 
 let s3StorageServiceClient: StorageService;
 
@@ -46,15 +56,67 @@ const getS3StorageServiceClient = (bucketName: string): StorageService => {
       endpoint: env.LANGFUSE_S3_EVENT_UPLOAD_ENDPOINT,
       region: env.LANGFUSE_S3_EVENT_UPLOAD_REGION,
       forcePathStyle: env.LANGFUSE_S3_EVENT_UPLOAD_FORCE_PATH_STYLE === "true",
+      awsSse: env.LANGFUSE_S3_EVENT_UPLOAD_SSE,
+      awsSseKmsKeyId: env.LANGFUSE_S3_EVENT_UPLOAD_SSE_KMS_KEY_ID,
     });
   }
   return s3StorageServiceClient;
 };
 
+/**
+ * Get the delay for the event based on the event type. Uses delay if set, 0 if current UTC timestamp is not between
+ * 23:45 and 00:15, and env.LANGFUSE_INGESTION_QUEUE_DELAY_MS otherwise.
+ * We need the delay around date boundaries to avoid duplicates for out-of-order processing of events.
+ * @param delay - Delay overwrite. Used if non-null.
+ */
+const getDelay = (delay: number | null, source: "api" | "otel") => {
+  if (delay !== null) {
+    return delay;
+  }
+  const now = new Date();
+  const hours = now.getUTCHours();
+  const minutes = now.getUTCMinutes();
+
+  if ((hours === 23 && minutes >= 45) || (hours === 0 && minutes <= 15)) {
+    return env.LANGFUSE_INGESTION_QUEUE_DELAY_MS;
+  }
+
+  if (source === "otel") {
+    return 0;
+  }
+
+  // Use 5s here to avoid duplicate processing on the worker. If the ingestion delay is set to a lower value,
+  // we use this instead.
+  // Values should be revisited based on a cost/performance trade-off.
+  return Math.min(5000, env.LANGFUSE_INGESTION_QUEUE_DELAY_MS);
+};
+
+/**
+ * Options for event batch processing.
+ * @property delay - Delay in ms to wait before processing events in the batch.
+ * @property source - Source of the events for metrics tracking (e.g., "otel", "api").
+ * @property isLangfuseInternal - Whether the events are being ingested by Langfuse internally (e.g. traces created for prompt experiments).
+ * @property forwardToEventsTable - Whether to forward events to the staging events table for batch propagation. If undefined, falls back to environment flags.
+ * @property attribution - Request-level ingestion attribution to persist on generated records.
+ */
+type ProcessEventBatchOptions = {
+  delay?: number | null;
+  source?: "api" | "otel";
+  isLangfuseInternal?: boolean;
+  forwardToEventsTable?: boolean;
+  attribution: IngestionAttribution;
+};
+
+/**
+ * Processes a batch of events.
+ * @param input - Batch of IngestionEventType. Will validate the types first thing and return errors if they are invalid.
+ * @param authCheck - AuthHeaderValidVerificationResultIngestion
+ * @param options - (Optional) Options for the event batch processing.
+ */
 export const processEventBatch = async (
   input: unknown[],
-  authCheck: AuthHeaderValidVerificationResult,
-  tokenCountDelegate: TokenCountDelegate,
+  authCheck: AuthHeaderValidVerificationResultIngestion,
+  options: ProcessEventBatchOptions,
 ): Promise<{
   successes: { id: string; status: number }[];
   errors: {
@@ -64,29 +126,48 @@ export const processEventBatch = async (
     error?: string;
   }[];
 }> => {
+  if (input.length === 0) {
+    return { successes: [], errors: [] };
+  }
+  const {
+    delay = null,
+    source = "api",
+    isLangfuseInternal = false,
+    forwardToEventsTable,
+    attribution,
+  } = options;
+
   // add context of api call to the span
   const currentSpan = getCurrentSpan();
-  recordIncrement("langfuse.ingestion.event", input.length);
-  currentSpan?.setAttribute("event_count", input.length);
+  recordIncrement("langfuse.ingestion.event", input.length, { source });
+  recordDistribution("langfuse.ingestion.event_distribution", input.length, {
+    source,
+  });
+
+  currentSpan?.setAttribute("langfuse.ingestion.batch_size", input.length);
+  currentSpan?.setAttribute(
+    "langfuse.project.id",
+    authCheck.scope.projectId ?? "",
+  );
+  if (authCheck.scope.orgId)
+    currentSpan?.setAttribute("langfuse.org.id", authCheck.scope.orgId);
+  if (authCheck.scope.plan)
+    currentSpan?.setAttribute("langfuse.org.plan", authCheck.scope.plan);
 
   /**************
    * VALIDATION *
    **************/
+  if (!authCheck.scope.projectId) {
+    throw new UnauthorizedError("Missing project ID");
+  }
+
   const validationErrors: { id: string; error: unknown }[] = [];
   const authenticationErrors: { id: string; error: unknown }[] = [];
 
-  const batch: z.infer<typeof ingestionEvent>[] = input
+  const ingestionSchema = createIngestionEventSchema(isLangfuseInternal);
+  const batch: z.infer<typeof ingestionSchema>[] = input
     .flatMap((event) => {
-      const parsed = instrumentSync(
-        { name: "ingestion-zod-parse-individual-event" },
-        (span) => {
-          const parsedBody = ingestionEvent.safeParse(event);
-          if (parsedBody.data?.id !== undefined) {
-            span.setAttribute("object.id", parsedBody.data.id);
-          }
-          return parsedBody;
-        },
-      );
+      const parsed = ingestionSchema.safeParse(event);
       if (!parsed.success) {
         validationErrors.push({
           id:
@@ -99,7 +180,7 @@ export const processEventBatch = async (
         });
         return [];
       }
-      if (!isAuthorized(parsed.data, authCheck, tokenCountDelegate)) {
+      if (!isAuthorized(parsed.data, authCheck)) {
         authenticationErrors.push({
           id: parsed.data.id,
           error: new UnauthorizedError("Access Scope Denied"),
@@ -121,6 +202,18 @@ export const processEventBatch = async (
 
   // We group events by eventBodyId which allows us to store and process them
   // as one which reduces infra interactions per event. Only used in the S3 case.
+  //
+  // The dedup struct also caches `entityType` and `bucketPrefix` so the two
+  // downstream loops (S3 upload + IngestionQueue enqueue) read a single
+  // source-of-truth per id instead of recomputing — that makes the
+  // producer/consumer-must-agree invariant structural. The sanitization warn
+  // log fires once at the time we resolve the prefix.
+  //
+  // `String(...)` preserves the prior null → "null" coercion of
+  // `authCheck.scope.projectId`. The surrounding function legitimately treats
+  // projectId as nullable elsewhere (metric labels, span attributes); we
+  // don't narrow it in the type system, and a `null` projectId would land
+  // events under an isolated `null/...` path rather than throw.
   const sortedBatchByEventBodyId = sortedBatch.reduce(
     (
       acc: Record<
@@ -130,6 +223,8 @@ export const processEventBatch = async (
           key: string;
           eventBodyId: string;
           type: (typeof eventTypes)[keyof typeof eventTypes];
+          entityType: IngestionEntityTypes;
+          bucketPrefix: string;
         }
       >,
       event,
@@ -137,16 +232,41 @@ export const processEventBatch = async (
       if (!event.body?.id) {
         return acc;
       }
-      const key = `${getClickhouseEntityType(event.type)}-${event.body.id}`;
-      if (!acc[key]) {
-        acc[key] = {
+      const entityType = getClickhouseEntityType(event.type);
+      const dedupKey = `${entityType}-${event.body.id}`;
+      if (!acc[dedupKey]) {
+        const eventBodyId = event.body.id;
+        const safeEventBodyId = safeBlobKeySegment(eventBodyId);
+        if (safeEventBodyId !== eventBodyId) {
+          // Do not log the raw or sanitized ID itself: the prefix can carry
+          // PII (litellm encodes provider/model/request metadata in the ID).
+          // The 16-hex hash is enough to correlate with the stored object
+          // during debugging.
+          logger.warn("Sanitized oversized/invalid entity ID for S3 key", {
+            projectId: authCheck.scope.projectId,
+            entityType,
+            originalIdByteLength: Buffer.byteLength(eventBodyId, "utf8"),
+            originalIdHash16: safeEventBodyId.slice(-HASH_HEX_LENGTH),
+          });
+        }
+        acc[dedupKey] = {
           data: [],
-          key: event.id,
+          // `event.id` becomes a single-segment filename (`<id>.json`) at S3
+          // write time and rides the queue payload as `fileKey`. Sanitize
+          // here so `/`, `\`, control bytes, and over-budget lengths can't
+          // reroute the write or overflow NAME_MAX.
+          key: safeBlobFilenameStem(event.id, ".json"),
           type: event.type,
-          eventBodyId: event.body.id,
+          eventBodyId,
+          entityType,
+          bucketPrefix: buildEventBucketPrefix({
+            projectId: String(authCheck.scope.projectId),
+            entityType,
+            entityId: eventBodyId,
+          }),
         };
       }
-      acc[key].data.push(event);
+      acc[dedupKey].data.push(event);
       return acc;
     },
     {},
@@ -157,9 +277,6 @@ export const processEventBatch = async (
    ********************/
   let s3UploadErrored = false;
   await instrumentAsync({ name: "s3-upload-events" }, async () => {
-    const s3Client = getS3StorageServiceClient(
-      env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
-    );
     // S3 Event Upload is blocking, but non-failing.
     // If a promise rejects, we log it below, but do not throw an error.
     // In this case, we upload the full batch into the Redis queue.
@@ -168,16 +285,38 @@ export const processEventBatch = async (
         // We upload the event in an array to the S3 bucket grouped by the eventBodyId.
         // That way we batch updates from the same invocation into a single file and reduce
         // write operations on S3.
-        const { data, key, type, eventBodyId } = sortedBatchByEventBodyId[id];
-        return s3Client.uploadJson(
-          `${env.LANGFUSE_S3_EVENT_UPLOAD_PREFIX}${authCheck.scope.projectId}/${getClickhouseEntityType(type)}/${eventBodyId}/${key}.json`,
-          data,
-        );
+        const { data, key, bucketPrefix } = sortedBatchByEventBodyId[id];
+        const bucketPath = `${bucketPrefix}${key}.json`;
+        return getS3StorageServiceClient(
+          env.LANGFUSE_S3_EVENT_UPLOAD_BUCKET,
+        ).uploadJson(bucketPath, data);
       }),
     );
     results.forEach((result) => {
       if (result.status === "rejected") {
         s3UploadErrored = true;
+
+        // Check if this is a SlowDown error and mark the project for secondary queue
+        if (isS3SlowDownError(result.reason)) {
+          logger.warn(
+            "S3 SlowDown error during upload, marking project for secondary queue",
+            {
+              projectId: authCheck.scope.projectId,
+              error: result.reason,
+            },
+          );
+          markProjectS3Slowdown(authCheck.scope.projectId!).catch(() => {});
+          markProjectIngestFailure(authCheck.scope.projectId!, {
+            source: "process_event_batch",
+            reason: "s3_slowdown",
+          });
+        } else {
+          markProjectIngestFailure(authCheck.scope.projectId!, {
+            source: "process_event_batch",
+            reason: "s3_upload_error",
+          });
+        }
+
         logger.error("Failed to upload event to S3", {
           error: result.reason,
         });
@@ -185,160 +324,121 @@ export const processEventBatch = async (
     });
   });
 
-  // This is a workaround to allow us to disable async ingestion processing for SDK CI testing
-  // TODO: remove this block after SDKs are ready for V3 async ingestion processing
-  if (env.LANGFUSE_SDK_CI_SYNC_PROCESSING_ENABLED === "true") {
-    const result = await handleBatch(
-      sortedBatch,
-      authCheck,
-      tokenCountDelegate,
-    );
-
-    //  in case we did not return early, we return the result here
-    return aggregateBatchResult(
-      [...validationErrors, ...authenticationErrors, ...result.errors],
-      result.results,
-      authCheck.scope.projectId,
-    );
-  }
-
   // Send each event individually to IngestionQueue for ClickHouse processing
-  if (env.LANGFUSE_CLICKHOUSE_INGESTION_ENABLED === "true") {
-    if (s3UploadErrored) {
-      throw new Error(
-        "Failed to upload events to blob storage, aborting event processing",
-      );
-    }
-
-    if (redis) {
-      const queue = IngestionQueue.getInstance();
-      await Promise.all(
-        Object.keys(sortedBatchByEventBodyId).map(async (id) =>
-          queue
-            ? queue.add(
-                QueueJobs.IngestionJob,
-                {
-                  id: randomUUID(),
-                  timestamp: new Date(),
-                  name: QueueJobs.IngestionJob as const,
-                  payload: {
-                    data: {
-                      type: sortedBatchByEventBodyId[id].type,
-                      eventBodyId: sortedBatchByEventBodyId[id].eventBodyId,
-                    },
-                    authCheck,
-                  },
-                },
-                {
-                  delay: env.LANGFUSE_INGESTION_QUEUE_DELAY_MS,
-                },
-              )
-            : Promise.reject("Failed to instantiate queue"),
-        ),
-      );
-      if (env.LANGFUSE_POSTGRES_INGESTION_ENABLED !== "true") {
-        // If postgres ingestion is disabled, we return early
-        return aggregateBatchResult(
-          [...validationErrors, ...authenticationErrors],
-          sortedBatch.map((event) => ({ id: event.id, result: event })),
-          authCheck.scope.projectId,
-        );
-      }
-    }
-  }
-
-  if (env.LANGFUSE_POSTGRES_INGESTION_ENABLED === "true") {
-    // As part of the legacy processing we sent the entire batch to the worker.
-    if (redis) {
-      const queue = LegacyIngestionQueue.getInstance();
-
-      if (queue) {
-        let addToQueueFailed = false;
-
-        const queuePayload: LegacyIngestionEventType = !s3UploadErrored
-          ? {
-              data: Object.keys(sortedBatchByEventBodyId).map((id) => {
-                const { key, type, eventBodyId } = sortedBatchByEventBodyId[id];
-                return {
-                  type,
-                  eventBodyId,
-                  eventId: key,
-                };
-              }),
-              authCheck,
-              useS3EventStore: true,
-            }
-          : { data: sortedBatch, authCheck, useS3EventStore: false };
-
-        try {
-          await queue.add(QueueJobs.LegacyIngestionJob, {
-            payload: queuePayload,
-            id: randomUUID(),
-            timestamp: new Date(),
-            name: QueueJobs.LegacyIngestionJob as const,
-          });
-        } catch (e: unknown) {
-          logger.warn(
-            "Failed to add batch to queue, falling back to sync processing",
-            e,
-          );
-          addToQueueFailed = true;
-        }
-
-        if (!addToQueueFailed) {
-          return aggregateBatchResult(
-            // we are not sending additional server errors to the client in case of early return
-            [...validationErrors, ...authenticationErrors],
-            sortedBatch.map((event) => ({ id: event.id, result: event })),
-            authCheck.scope.projectId,
-          );
-        }
-      } else {
-        logger.warn(
-          "Ingestion queue not initialized, falling back to sync processing",
-        );
-      }
-    }
-
-    /*******************
-     * SYNC PROCESSING *
-     *******************/
-    const result = await handleBatch(
-      sortedBatch,
-      authCheck,
-      tokenCountDelegate,
-    );
-
-    //  in case we did not return early, we return the result here
-    return aggregateBatchResult(
-      [...validationErrors, ...authenticationErrors, ...result.errors],
-      result.results,
-      authCheck.scope.projectId,
+  if (s3UploadErrored) {
+    throw new Error(
+      "Failed to upload events to blob storage, aborting event processing",
     );
   }
 
-  throw new Error(
-    "Either Clickhouse or Postgres ingestion (or both) must be enabled",
+  if (!redis) {
+    throw new Error("Redis not initialized, aborting event processing");
+  }
+
+  const projectIdsToSkipS3List =
+    env.LANGFUSE_SKIP_S3_LIST_FOR_OBSERVATIONS_PROJECT_IDS?.split(",") ?? [];
+
+  await Promise.all(
+    Object.keys(sortedBatchByEventBodyId).map(async (id) => {
+      const eventData = sortedBatchByEventBodyId[id];
+      const shardingKey = `${authCheck.scope.projectId}-${eventData.eventBodyId}`;
+      const queue = IngestionQueue.getInstance({ shardingKey });
+
+      const isDatasetRunItemEvent = eventData.entityType === "dataset_run_item";
+      const isObservationEvent = eventData.entityType === "observation";
+
+      const isOtelOrSkipS3Project =
+        authCheck.scope.projectId !== null &&
+        (source === "otel" ||
+          projectIdsToSkipS3List.includes(authCheck.scope.projectId));
+
+      const shouldSkipS3List =
+        isDatasetRunItemEvent || (isObservationEvent && isOtelOrSkipS3Project);
+
+      const { isSampled, isSamplingConfigured } = isTraceIdInSample({
+        projectId: authCheck.scope.projectId,
+        event: eventData.data[0],
+      });
+
+      if (!isSampled) {
+        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
+          projectId: authCheck.scope.projectId ?? "<not set>",
+          sampling_decision: "out",
+        });
+
+        return;
+      }
+
+      if (isSamplingConfigured) {
+        recordIncrement("langfuse.ingestion.sampling", eventData.data.length, {
+          projectId: authCheck.scope.projectId ?? "<not set>",
+          sampling_decision: "in",
+        });
+      }
+
+      return queue
+        ? queue.add(
+            QueueJobs.IngestionJob,
+            {
+              id: randomUUID(),
+              timestamp: new Date(),
+              name: QueueJobs.IngestionJob as const,
+              payload: {
+                data: {
+                  type: eventData.type,
+                  eventBodyId: eventData.eventBodyId,
+                  fileKey: eventData.key,
+                  skipS3List: shouldSkipS3List,
+                  forwardToEventsTable,
+                  bucketPrefix: eventData.bucketPrefix,
+                  ingestionApiKey: attribution.ingestionApiKey,
+                  ingestionSdkName: attribution.ingestionSdkName,
+                  ingestionSdkVersion: attribution.ingestionSdkVersion,
+                },
+                authCheck: authCheck as {
+                  validKey: true;
+                  scope: {
+                    projectId: string;
+                    accessLevel: "project" | "scores";
+                  };
+                },
+              },
+            },
+            { delay: getDelay(delay, source) },
+          )
+        : Promise.reject("Failed to instantiate ingestion queue");
+    }),
+  );
+
+  return aggregateBatchResult(
+    [...validationErrors, ...authenticationErrors],
+    sortedBatch.map((event) => ({ id: event.id, result: event })),
+    authCheck.scope.projectId,
   );
 };
 
 const isAuthorized = (
   event: IngestionEventType,
-  authScope: AuthHeaderValidVerificationResult,
-  tokenCountDelegate: TokenCountDelegate,
+  authScope: AuthHeaderValidVerificationResultIngestion,
 ): boolean => {
-  try {
-    getProcessorForEvent(event, tokenCountDelegate).auth(authScope.scope);
+  if (event.type === eventTypes.SDK_LOG) {
     return true;
-  } catch (error) {
-    return false;
   }
+
+  if (event.type === eventTypes.SCORE_CREATE) {
+    return (
+      authScope.scope.accessLevel === "scores" ||
+      authScope.scope.accessLevel === "project"
+    );
+  }
+
+  return authScope.scope.accessLevel === "project";
 };
 
 /**
  * Sorts a batch of ingestion events. Orders by: updating events last, sorted by timestamp asc.
  */
-const sortBatch = (batch: Array<z.infer<typeof ingestionEvent>>) => {
+const sortBatch = (batch: IngestionEventType[]) => {
   const updateEvents: (typeof eventTypes)[keyof typeof eventTypes][] = [
     eventTypes.GENERATION_UPDATE,
     eventTypes.SPAN_UPDATE,
@@ -408,8 +508,7 @@ export const aggregateBatchResult = (
   });
 
   if (returnedErrors.length > 0) {
-    traceException(errors);
-    logger.error("Error processing events", {
+    logger.warn("Error processing events", {
       errors: returnedErrors,
       "langfuse.project.id": projectId,
     });

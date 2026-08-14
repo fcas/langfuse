@@ -1,12 +1,12 @@
+/* eslint-disable @repo/no-style-props */
 "use client";
 
 import * as React from "react";
-import { CheckIcon } from "@radix-ui/react-icons";
 import * as RadioGroupPrimitive from "@radix-ui/react-radio-group";
 import { cn } from "@/src/utils/tailwind";
 
 const RadioGroup = React.forwardRef<
-  React.ElementRef<typeof RadioGroupPrimitive.Root>,
+  React.ComponentRef<typeof RadioGroupPrimitive.Root>,
   React.ComponentPropsWithoutRef<typeof RadioGroupPrimitive.Root>
 >(({ className, ...props }, ref) => {
   return (
@@ -20,20 +20,20 @@ const RadioGroup = React.forwardRef<
 RadioGroup.displayName = RadioGroupPrimitive.Root.displayName;
 
 const RadioGroupItem = React.forwardRef<
-  React.ElementRef<typeof RadioGroupPrimitive.Item>,
+  React.ComponentRef<typeof RadioGroupPrimitive.Item>,
   React.ComponentPropsWithoutRef<typeof RadioGroupPrimitive.Item>
 >(({ className, ...props }, ref) => {
   return (
     <RadioGroupPrimitive.Item
       ref={ref}
       className={cn(
-        "aspect-square h-4 w-4 rounded-full border border-primary text-primary shadow focus:outline-none focus-visible:ring-1 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-50",
+        "border-control-border focus-visible:ring-ring data-[state=checked]:border-control-fill aspect-square h-4 w-4 rounded-full border shadow-sm focus:outline-hidden focus-visible:ring-1 disabled:cursor-not-allowed disabled:opacity-50",
         className,
       )}
       {...props}
     >
       <RadioGroupPrimitive.Indicator className="flex items-center justify-center">
-        <CheckIcon className="h-3.5 w-3.5 fill-primary" />
+        <div className="bg-control-fill h-2 w-2 rounded-full" />
       </RadioGroupPrimitive.Indicator>
     </RadioGroupPrimitive.Item>
   );

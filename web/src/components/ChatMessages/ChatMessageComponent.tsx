@@ -1,29 +1,124 @@
-import { capitalize } from "lodash";
+import capitalize from "lodash/capitalize";
 import { GripVertical, MinusCircleIcon } from "lucide-react";
-import { type ChangeEvent, useEffect, useState, useRef } from "react";
-import { ChatMessageRole, type ChatMessageWithId } from "@langfuse/shared";
+import {
+  memo,
+  useState,
+  useCallback,
+  useEffect,
+  useRef,
+  type RefObject,
+} from "react";
+import { type ReactCodeMirrorRef } from "@uiw/react-codemirror";
+import {
+  type ChatMessage,
+  ChatMessageRole,
+  ChatMessageType,
+  type ChatMessageWithId,
+  type LLMToolCall,
+  type PlaceholderMessage,
+} from "@langfuse/shared";
 import { Button } from "@/src/components/ui/button";
 import { Card, CardContent } from "@/src/components/ui/card";
-import { Textarea } from "@/src/components/ui/textarea";
+import { CodeMirrorEditor } from "@/src/components/editor";
 import type { MessagesContext } from "./types";
 import { useSortable } from "@dnd-kit/sortable";
 import { cn } from "@/src/utils/tailwind";
 import { CSS } from "@dnd-kit/utilities";
+import { ToolCallCard } from "./ToolCallCard";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/src/components/ui/select";
+import { useOptionalPlaygroundContext } from "@/src/features/playground/page/context";
+import {
+  useOptionalMessageSearchActions,
+  useOptionalMessageSearchPageId,
+} from "./MessageSearch";
+
+export type MessageRowRefs = {
+  rowRef: RefObject<HTMLDivElement | null>;
+  editorRef: RefObject<ReactCodeMirrorRef | null>;
+};
 
 type ChatMessageProps = Pick<
   MessagesContext,
-  "deleteMessage" | "updateMessage" | "availableRoles"
-> & { message: ChatMessageWithId };
+  | "deleteMessage"
+  | "updateMessage"
+  | "availableRoles"
+  | "toolCallIds"
+  | "replaceMessage"
+> & {
+  message: ChatMessageWithId;
+  index: number;
+  // Lets the parent ChatMessages track this row's DOM + editor refs so it can
+  // scroll to and focus a freshly added message (LFE-6864).
+  registerRow?: (id: string, refs: MessageRowRefs | null) => void;
+};
+
+const ROLES: ChatMessageRole[] = [
+  ChatMessageRole.User,
+  ChatMessageRole.System,
+  ChatMessageRole.Developer,
+  ChatMessageRole.Assistant,
+  ChatMessageRole.Tool,
+] as const;
+
+const getRoleNamePlaceholder = (role: string) => {
+  switch (role) {
+    case ChatMessageRole.System:
+      return "a system message";
+    case ChatMessageRole.Developer:
+      return "a developer message";
+    case ChatMessageRole.Assistant:
+      return "an assistant message";
+    case ChatMessageRole.User:
+      return "a user message";
+    case ChatMessageRole.Tool:
+      return "a tool response message";
+    case "placeholder":
+      return "placeholder name (e.g. chat_history)";
+    default:
+      return `a ${role}`;
+  }
+};
+
+const ToolCalls: React.FC<{ toolCalls: LLMToolCall[] }> = ({ toolCalls }) => {
+  if (!toolCalls || toolCalls.length === 0) return null;
+
+  return (
+    <div className="w-full space-y-2">
+      {toolCalls.map((toolCall) => (
+        <ToolCallCard key={toolCall.id} toolCall={toolCall} />
+      ))}
+    </div>
+  );
+};
 
 export const ChatMessageComponent: React.FC<ChatMessageProps> = ({
   message,
   updateMessage,
   deleteMessage,
+  replaceMessage,
   availableRoles,
+  index: _index,
+  toolCallIds,
+  registerRow,
 }) => {
-  const textAreaRef = useRef<HTMLTextAreaElement | null>(null);
-  const [textAreaRows, setTextAreaRows] = useState(1);
   const [roleIndex, setRoleIndex] = useState(1);
+  const playgroundContext = useOptionalPlaygroundContext();
+  const searchPageId = useOptionalMessageSearchPageId();
+  const messageSearchActions = useOptionalMessageSearchActions();
+  const pageId = playgroundContext?.windowId ?? searchPageId;
+  const registerMessageTarget = messageSearchActions?.registerMessageTarget;
+  const unregisterMessageTarget = messageSearchActions?.unregisterMessageTarget;
+  const shouldUseMessageSearch = Boolean(
+    pageId && registerMessageTarget && unregisterMessageTarget,
+  );
+  const rowRef = useRef<HTMLDivElement | null>(null);
+  const editorRef = useRef<ReactCodeMirrorRef>(null);
 
   const {
     attributes,
@@ -34,8 +129,17 @@ export const ChatMessageComponent: React.FC<ChatMessageProps> = ({
     isDragging,
   } = useSortable({ id: message.id });
 
+  const setCardRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      rowRef.current = node;
+      setNodeRef(node);
+    },
+    [setNodeRef],
+  );
+
   const toggleRole = () => {
-    if (message.role === ChatMessageRole.System) return;
+    // Only allow role toggling for messages that have a role property (not placeholder messages)
+    if (!("role" in message)) return;
 
     // if user has set custom roles, available roles will be non-empty and we toggle through custom and default roles (assistant, user)
     if (!!availableRoles && Boolean(availableRoles.length)) {
@@ -43,99 +147,275 @@ export const ChatMessageComponent: React.FC<ChatMessageProps> = ({
       if (randomRole === message.role) {
         randomRole = availableRoles[(roleIndex + 1) % availableRoles.length];
       }
-      updateMessage(message.id, "role", randomRole);
+      replaceMessage(message.id, {
+        content: message.content,
+        role: randomRole,
+        type: ChatMessageType.PublicAPICreated,
+      });
       setRoleIndex(roleIndex + 1);
     } else {
       // if user has not set custom roles, we toggle through default roles (assistant, user)
-      updateMessage(
-        message.id,
-        "role",
-        message.role === ChatMessageRole.User
-          ? ChatMessageRole.Assistant
-          : ChatMessageRole.User,
+      // Allow all roles including system and developer at any position
+      const eligibleRoles = ROLES.filter(
+        (r) =>
+          r !== ChatMessageRole.Tool || (toolCallIds && toolCallIds.length > 0),
       );
+      const currentIndex = eligibleRoles.indexOf(
+        ("role" in message
+          ? message.role
+          : ChatMessageRole.User) as ChatMessageRole,
+      );
+      const nextRole = eligibleRoles[(currentIndex + 1) % eligibleRoles.length];
+
+      if (nextRole === ChatMessageRole.User) {
+        replaceMessage(message.id, {
+          content: message.content,
+          role: nextRole,
+          type: ChatMessageType.User,
+        });
+      } else if (nextRole === ChatMessageRole.Assistant) {
+        replaceMessage(message.id, {
+          content: message.content,
+          role: nextRole,
+          type: ChatMessageType.AssistantText,
+        });
+      } else if (nextRole === ChatMessageRole.Tool) {
+        replaceMessage(message.id, {
+          content: message.content,
+          role: nextRole,
+          type: ChatMessageType.ToolResult,
+          toolCallId: toolCallIds?.[0] ?? "",
+        });
+      } else if (nextRole === ChatMessageRole.Developer) {
+        replaceMessage(message.id, {
+          content: message.content,
+          role: nextRole,
+          type: ChatMessageType.Developer,
+        });
+      } else if (nextRole === ChatMessageRole.System) {
+        replaceMessage(message.id, {
+          content: message.content,
+          role: nextRole,
+          type: ChatMessageType.System,
+        });
+      } else if (nextRole === ChatMessageRole.Model) {
+        replaceMessage(message.id, {
+          content: message.content,
+          role: nextRole,
+          type: ChatMessageType.ModelText,
+        });
+      } else {
+        const exhaustiveCheck: never = nextRole;
+        console.error(`Unhandled role: ${exhaustiveCheck}`);
+      }
     }
   };
 
-  const handleContentChange = (event: ChangeEvent<HTMLTextAreaElement>) => {
-    updateMessage(message.id, "content", event.target.value);
-  };
+  const onValueChange = useCallback(
+    (value: string) => {
+      if (message.type === ChatMessageType.Placeholder) {
+        updateMessage(message.type, message.id, "name", value);
+      } else {
+        updateMessage(message.type, message.id, "content", value);
+      }
+    },
+    [message.id, message.type, updateMessage],
+  );
 
-  const placeholder = `Enter ${message.role === ChatMessageRole.User ? "a user" : message.role === ChatMessageRole.System ? "a system" : "an assistant"} message here.`;
+  const onPlaceholderNameChange = useCallback(
+    (value: string) => {
+      if (message.type === ChatMessageType.Placeholder) {
+        updateMessage(message.type, message.id, "name", value);
+      }
+    },
+    [message.id, message.type, updateMessage],
+  );
+
+  const showToolCallSelect = message.type === ChatMessageType.ToolResult;
+  const isPlaceholder = message.type === ChatMessageType.Placeholder;
 
   useEffect(() => {
-    const textAreaWidth = textAreaRef.current?.clientWidth ?? 0;
-    const charsPerRow = Math.floor(textAreaWidth / 10);
+    if (!pageId || !registerMessageTarget || !unregisterMessageTarget) {
+      return;
+    }
 
-    setTextAreaRows(
-      countContentRows(message.content, charsPerRow || undefined),
-    );
-  }, [message.content]);
+    registerMessageTarget(pageId, message.id, {
+      rowRef,
+      editorRef,
+    });
+
+    return () => {
+      unregisterMessageTarget(pageId, message.id);
+    };
+  }, [
+    editorRef,
+    message.id,
+    pageId,
+    registerMessageTarget,
+    unregisterMessageTarget,
+  ]);
+
+  // Keep the parent ChatMessages registry in sync so it can scroll to and
+  // focus this row when it is the newly added message (LFE-6864). The actual
+  // registration happens in handleEditorMount once CodeMirror has mounted and
+  // editorRef.current is populated — registering here on first render would
+  // store a null editor (CodeMirror mounts async). This effect only handles
+  // unregistering the row when it unmounts.
+  useEffect(() => {
+    return () => {
+      registerRow?.(message.id, null);
+    };
+  }, [message.id, registerRow]);
+
+  const handleEditorMount = useCallback(() => {
+    registerRow?.(message.id, { rowRef, editorRef });
+
+    if (!pageId || !registerMessageTarget) {
+      return;
+    }
+
+    registerMessageTarget(pageId, message.id, {
+      rowRef,
+      editorRef,
+    });
+  }, [message.id, pageId, registerMessageTarget, registerRow]);
 
   return (
     <Card
-      ref={setNodeRef}
+      ref={setCardRef}
       style={{
         transform: CSS.Transform.toString(transform),
         transition,
       }}
       className={cn(
         isDragging ? "opacity-80" : "opacity-100",
-        "group relative whitespace-nowrap p-3",
+        "group relative border p-1 shadow-2xs transition-shadow duration-200 hover:shadow-xs",
       )}
     >
-      {message.role !== ChatMessageRole.System && (
+      <div className="flex flex-row justify-center">
         <div
           {...attributes}
           {...listeners}
-          className="absolute bottom-0 left-0 top-4 flex w-6 cursor-move justify-center"
+          className="flex w-3 cursor-move items-center justify-center opacity-50 transition-opacity hover:opacity-100"
         >
-          <GripVertical className="h-4 w-4" />
+          <GripVertical className="h-3 w-3" />
         </div>
-      )}
-      <CardContent className="ml-4 flex flex-row space-x-1 p-0">
-        <div className="min-w-[6rem]">
+        <CardContent className="flex flex-1 flex-row items-center gap-2 p-0 pl-1">
+          <div className="bg-background sticky top-0 bottom-0 z-10 flex w-16 shrink-0 flex-col gap-1">
+            {isPlaceholder ? (
+              <span className="bg-accent text-muted-foreground inline-flex h-6 w-full items-center justify-center rounded-md px-4 font-mono text-[9px]">
+                placeholder
+              </span>
+            ) : (
+              <Button
+                onClick={toggleRole}
+                type="button"
+                variant="ghost"
+                className="text-muted-foreground hover:bg-accent hover:text-accent-foreground h-6 w-full px-1 py-0 text-[10px] font-bold"
+              >
+                {capitalize(message.role)}
+              </Button>
+            )}
+          </div>
+          <div className="flex flex-1 flex-col gap-1">
+            <div className="flex gap-2">
+              {showToolCallSelect && (
+                <Select
+                  value={message.toolCallId}
+                  onValueChange={(value) =>
+                    updateMessage(
+                      ChatMessageType.ToolResult,
+                      message.id,
+                      "toolCallId",
+                      value,
+                    )
+                  }
+                >
+                  <SelectTrigger
+                    title="Select Tool Call ID"
+                    className="bg-muted h-[25px] w-[96px] border-0 text-[9px]"
+                  >
+                    <SelectValue placeholder="Select Call ID" />
+                  </SelectTrigger>
+                  <SelectContent>
+                    {toolCallIds?.map((id) => (
+                      <SelectItem key={id} value={id} className="text-[10px]">
+                        {id}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              )}
+              {isPlaceholder ? (
+                <MemoizedEditor
+                  value={(message as PlaceholderMessage).name || ""}
+                  onChange={onPlaceholderNameChange}
+                  role={message.type}
+                  editorRef={editorRef}
+                  onEditorMount={handleEditorMount}
+                  enableSearchKeymap={!shouldUseMessageSearch}
+                />
+              ) : (
+                <MemoizedEditor
+                  value={message.content}
+                  onChange={onValueChange}
+                  role={message.role}
+                  editorRef={editorRef}
+                  onEditorMount={handleEditorMount}
+                  enableSearchKeymap={!shouldUseMessageSearch}
+                />
+              )}
+            </div>
+            {message.type === ChatMessageType.AssistantToolCall && (
+              <ToolCalls toolCalls={message.toolCalls as LLMToolCall[]} />
+            )}
+          </div>
           <Button
-            onClick={toggleRole}
-            type="button" // prevents submitting a form if this button is inside a form
-            variant="outline"
-            className="text-xs"
+            variant="ghost"
+            type="button"
+            size="icon"
+            onClick={() => deleteMessage(message.id)}
+            className="h-5 w-5 shrink-0 rounded-full p-0 opacity-60 transition-all hover:opacity-100"
+            aria-label="Delete message"
           >
-            {capitalize(message.role)}
+            <MinusCircleIcon size={14} />
           </Button>
-        </div>
-
-        <Textarea
-          ref={textAreaRef}
-          id={message.id}
-          className="height-[auto] min-h-6 w-full font-mono text-xs focus:outline-none"
-          placeholder={placeholder}
-          value={message.content}
-          onChange={handleContentChange}
-          rows={textAreaRows}
-        />
-        <Button
-          variant="ghost"
-          type="button" // prevents submitting a form if this button is inside a form
-          size="icon"
-          onClick={() => deleteMessage(message.id)}
-          disabled={message.role === ChatMessageRole.System}
-        >
-          <MinusCircleIcon size={16} />
-        </Button>
-      </CardContent>
+        </CardContent>
+      </div>
     </Card>
   );
 };
 
-function countContentRows(str: string, charsPerRow = 80) {
-  const lines = str.split("\n");
+const MemoizedEditor = memo(function MemoizedEditor(props: {
+  value: string;
+  role: ChatMessage["role"];
+  onChange: (value: string) => void;
+  editorRef: RefObject<ReactCodeMirrorRef | null>;
+  onEditorMount: () => void;
+  enableSearchKeymap: boolean;
+}) {
+  const {
+    value,
+    role,
+    onChange,
+    editorRef,
+    onEditorMount,
+    enableSearchKeymap,
+  } = props;
+  const placeholder = `Enter ${getRoleNamePlaceholder(role)} here.`;
 
-  const totalRows = lines.reduce((acc, line) => {
-    const additionalRows = Math.max(1, Math.ceil(line.length / charsPerRow));
-
-    return acc + additionalRows;
-  }, 0);
-
-  return totalRows;
-}
+  return (
+    <CodeMirrorEditor
+      value={value}
+      onChange={onChange}
+      mode="prompt"
+      className="w-full rounded-md border-0"
+      editable={true}
+      lineNumbers={false}
+      placeholder={placeholder}
+      editorRef={editorRef}
+      enableSearchKeymap={enableSearchKeymap}
+      onEditorMount={onEditorMount}
+    />
+  );
+});

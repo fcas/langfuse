@@ -1,78 +1,19 @@
 import {
-  type OptionsDefinition,
   type ColumnDefinition,
-  ScoreSource,
-  ScoreDataType,
+  formatColumnOptions,
+  type SingleValueOption,
+  scoresTableCols,
 } from "@langfuse/shared";
 
-export const scoresTableCols: ColumnDefinition[] = [
-  {
-    name: "Trace ID",
-    id: "traceId",
-    type: "string",
-    internal: 's."trace_id"',
-  },
-  {
-    name: "Trace Name",
-    id: "traceName",
-    type: "string",
-    internal: 't."name"',
-    nullable: true,
-  },
-  {
-    name: "Observation ID",
-    id: "observationId",
-    type: "string",
-    internal: 's."observation_id"',
-  },
-  {
-    name: "Timestamp",
-    id: "timestamp",
-    type: "datetime",
-    internal: 's."timestamp"',
-  },
-  {
-    name: "Source",
-    id: "source",
-    type: "stringOptions",
-    internal: 's."source"::text',
-    options: Object.values(ScoreSource).map((value) => ({ value })),
-  },
-  {
-    name: "Data Type",
-    id: "dataType",
-    type: "stringOptions",
-    internal: 's."data_type"::text',
-    options: Object.values(ScoreDataType).map((value) => ({ value })),
-  },
-  {
-    name: "Name",
-    id: "name",
-    type: "stringOptions",
-    internal: 's."name"',
-    options: [], // to be added at runtime
-  },
-  { name: "Value", id: "value", type: "number", internal: 's."value"' },
-  {
-    name: "User ID",
-    id: "userId",
-    type: "string",
-    internal: 't."user_id"',
-    nullable: true,
-  },
-  {
-    name: "Trace Tags",
-    id: "tags",
-    type: "arrayOptions",
-    internal: 't."tags"',
-    options: [], // to be added at runtime
-    nullable: true,
-  },
-];
+export { scoresTableCols };
 
 export type ScoreOptions = {
-  name: Array<OptionsDefinition>;
-  tags: Array<OptionsDefinition>;
+  name: Array<SingleValueOption>;
+  tags: Array<SingleValueOption>;
+  traceName: Array<SingleValueOption>;
+  userId: Array<SingleValueOption>;
+  stringValue: Array<SingleValueOption>;
+  booleanValue: Array<SingleValueOption>;
 };
 
 export function scoresTableColsWithOptions(
@@ -80,10 +21,22 @@ export function scoresTableColsWithOptions(
 ): ColumnDefinition[] {
   return scoresTableCols.map((col) => {
     if (col.id === "name") {
-      return { ...col, options: options?.name ?? [] };
+      return formatColumnOptions(col, options?.name ?? []);
     }
     if (col.id === "tags") {
-      return { ...col, options: options?.tags ?? [] };
+      return formatColumnOptions(col, options?.tags ?? []);
+    }
+    if (col.id === "traceName") {
+      return formatColumnOptions(col, options?.traceName ?? []);
+    }
+    if (col.id === "userId") {
+      return formatColumnOptions(col, options?.userId ?? []);
+    }
+    if (col.id === "stringValue") {
+      return formatColumnOptions(col, options?.stringValue ?? []);
+    }
+    if (col.id === "booleanValue") {
+      return formatColumnOptions(col, options?.booleanValue ?? []);
     }
     return col;
   });

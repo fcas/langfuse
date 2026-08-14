@@ -1,243 +1,228 @@
-import { prisma } from "@langfuse/shared/src/db";
 import {
   PostTracesV1Body,
   GetTracesV1Query,
   GetTracesV1Response,
   PostTracesV1Response,
+  DeleteTracesV1Body,
+  DeleteTracesV1Response,
+  TRACE_FIELD_GROUPS,
+  type TraceFieldGroup,
 } from "@/src/features/public-api/types/traces";
-import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { createAuthedAPIRoute } from "@/src/features/public-api/server/createAuthedAPIRoute";
-import { Prisma } from "@langfuse/shared/src/db";
-import { processEventBatch } from "@langfuse/shared/src/server";
-import { tokenCount } from "@/src/features/ingest/usage";
-
-import { type Trace } from "@langfuse/shared";
+import { InvalidRequestError } from "@langfuse/shared";
 import {
+  LEGACY_PUBLIC_API_OBSERVATIONS_CLICKHOUSE_RESOURCE_ERROR_MESSAGE,
+  withMiddlewares,
+} from "@/src/features/public-api/server/withMiddlewares";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
+import { processEventBatch } from "@langfuse/shared/src/server";
+import {
+  createIngestionAttribution,
   eventTypes,
   logger,
-  orderByToPrismaSql,
+  traceDeletionProcessor,
+  getTracesFromEventsTableForPublicApi,
+  getTracesCountFromEventsTableForPublicApi,
 } from "@langfuse/shared/src/server";
-
 import { v4 } from "uuid";
 import { telemetry } from "@/src/features/telemetry";
-import { tracesTableCols } from "@langfuse/shared";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
+import { auditLog } from "@/src/features/audit-logs/auditLog";
 import {
   generateTracesForPublicApi,
   getTracesCountForPublicApi,
 } from "@/src/features/public-api/server/traces";
+import { env } from "@/src/env.mjs";
+import { legacyPublicApiRateLimitUpgradePaths } from "@/src/features/public-api/server/rateLimitUpgradePaths";
+import { TRACES_DEPRECATION } from "@/src/features/public-api/server/deprecations";
 
-export default withMiddlewares({
-  POST: createAuthedAPIRoute({
-    name: "Create Trace (Legacy)",
-    bodySchema: PostTracesV1Body,
-    responseSchema: PostTracesV1Response, // Adjust this if you have a specific response schema
-    rateLimitResource: "legacy-ingestion",
-    fn: async ({ body, auth, res }) => {
-      await telemetry();
-      const event = {
-        id: v4(),
-        type: eventTypes.TRACE_CREATE,
-        timestamp: new Date().toISOString(),
-        body: body,
-      };
-      if (!event.body.id) {
-        event.body.id = v4();
-      }
-      const result = await processEventBatch([event], auth, tokenCount);
-      if (result.errors.length > 0) {
-        const error = result.errors[0];
-        res
-          .status(error.status)
-          .json({ message: error.error ?? error.message });
-        return { id: "" }; // dummy return
-      }
-      if (result.successes.length !== 1) {
-        logger.error("Failed to create trace", { result });
-        throw new Error("Failed to create trace");
-      }
-      return { id: event.body.id };
-    },
-  }),
+export default withMiddlewares(
+  {
+    POST: createAuthedProjectAPIRoute({
+      name: "Create Trace (Legacy)",
+      bodySchema: PostTracesV1Body,
+      responseSchema: PostTracesV1Response, // Adjust this if you have a specific response schema
+      rateLimitResource: "legacy-ingestion",
+      // Legacy POST writes a trace-create event that lands in the legacy traces
+      // ClickHouse table; events_only deployments expect OTel ingestion.
+      rejectInEventsOnlyMode: true,
+      fn: async ({ body, auth, req, res }) => {
+        await telemetry();
+        const event = {
+          id: v4(),
+          type: eventTypes.TRACE_CREATE,
+          timestamp: new Date().toISOString(),
+          body: body,
+        };
+        if (!event.body.id) {
+          event.body.id = v4();
+        }
+        const result = await processEventBatch([event], auth, {
+          attribution: createIngestionAttribution({
+            headers: req.headers,
+            authCheck: auth,
+          }),
+        });
+        if (result.errors.length > 0) {
+          const error = result.errors[0];
+          res
+            .status(error.status)
+            .json({ message: error.error ?? error.message });
+          return { id: "" }; // dummy return
+        }
+        if (result.successes.length !== 1) {
+          logger.error("Failed to create trace", { result });
+          throw new Error("Failed to create trace");
+        }
+        return { id: event.body.id };
+      },
+    }),
 
-  GET: createAuthedAPIRoute({
-    name: "Get Traces",
-    querySchema: GetTracesV1Query,
-    responseSchema: GetTracesV1Response,
-    fn: async ({ query, auth }) => {
-      return await measureAndReturnApi({
-        input: { projectId: auth.scope.projectId, queryClickhouse: false },
-        operation: "api/public/traces",
-        user: null,
-        pgExecution: async () => {
-          const skipValue = (query.page - 1) * query.limit;
-          const userCondition = query.userId
-            ? Prisma.sql`AND t."user_id" = ${query.userId}`
-            : Prisma.empty;
-          const nameCondition = query.name
-            ? Prisma.sql`AND t."name" = ${query.name}`
-            : Prisma.empty;
-          const tagsCondition = query.tags
-            ? Prisma.sql`AND ARRAY[${Prisma.join(
-                (Array.isArray(query.tags)
-                  ? query.tags
-                  : query.tags.split(",")
-                ).map((v) => Prisma.sql`${v}`),
-                ", ",
-              )}] <@ t."tags"`
-            : Prisma.empty;
-          const sessionCondition = query.sessionId
-            ? Prisma.sql`AND t."session_id" = ${query.sessionId}`
-            : Prisma.empty;
-          const fromTimestampCondition = query.fromTimestamp
-            ? Prisma.sql`AND t."timestamp" >= ${query.fromTimestamp}::timestamp with time zone at time zone 'UTC'`
-            : Prisma.empty;
-          const toTimestampCondition = query.toTimestamp
-            ? Prisma.sql`AND t."timestamp" < ${query.toTimestamp}::timestamp with time zone at time zone 'UTC'`
-            : Prisma.empty;
-          const versionCondition = query.version
-            ? Prisma.sql`AND t."version" = ${query.version}`
-            : Prisma.empty;
-          const releaseCondition = query.release
-            ? Prisma.sql`AND t."release" = ${query.release}`
-            : Prisma.empty;
-
-          const orderByCondition = orderByToPrismaSql(
-            query.orderBy ?? null,
-            tracesTableCols,
+    GET: createAuthedProjectAPIRoute({
+      name: "Get Traces",
+      rateLimitResource: "public-api-legacy",
+      querySchema: GetTracesV1Query,
+      responseSchema: GetTracesV1Response,
+      deprecation: TRACES_DEPRECATION,
+      rateLimitUpgradePath: legacyPublicApiRateLimitUpgradePaths.tracesList,
+      rejectInEventsOnlyMode: true,
+      fn: async ({ query, auth }) => {
+        // Api-performance controls.
+        // 1. Reject if no date range and rejection is enabled
+        if (
+          env.LANGFUSE_API_TRACES_REJECT_NO_DATE_RANGE === "true" &&
+          !query.fromTimestamp
+        ) {
+          throw new InvalidRequestError(
+            "fromTimestamp is required. Set the fromTimestamp query parameter to filter traces by date.",
           );
+        }
 
-          const traces = await prisma.$queryRaw<
-            Array<
-              Trace & {
-                observations: string[];
-                scores: string[];
-                totalCost: number;
-                latency: number;
-                htmlPath: string;
-              }
-            >
-          >(Prisma.sql`
-            SELECT
-              t.id,
-              CONCAT('/project/', t.project_id,'/traces/',t.id) as "htmlPath",
-              t.timestamp,
-              t.name,
-              t.input,
-              t.output,
-              t.project_id as "projectId",
-              t.session_id as "sessionId",
-              t.metadata,
-              t.external_id as "externalId",
-              t.user_id as "userId",
-              t.release,
-              t.version,
-              t.bookmarked,
-              t.created_at as "createdAt",
-              t.updated_at as "updatedAt",
-              t.public,
-              t.tags,
-              COALESCE(o."totalCost", 0)::DOUBLE PRECISION AS "totalCost",
-              COALESCE(o."latency", 0)::double precision AS "latency",
-              COALESCE(o."observations", ARRAY[]::text[]) AS "observations",
-              COALESCE(s."scores", ARRAY[]::text[]) AS "scores"
-            FROM (
-              SELECT *
-              FROM "traces" t
-              WHERE project_id = ${auth.scope.projectId}
-              ${fromTimestampCondition}
-              ${toTimestampCondition}
-              ${userCondition}
-              ${nameCondition}
-              ${tagsCondition}
-              ${versionCondition}
-              ${releaseCondition}
-              ${sessionCondition}
-              ${orderByCondition}
-              LIMIT ${query.limit} OFFSET ${skipValue}
-            ) AS t
-            LEFT JOIN LATERAL (
-              SELECT
-                SUM(o.calculated_total_cost)::DOUBLE PRECISION AS "totalCost",
-                EXTRACT(EPOCH FROM COALESCE(MAX(o."end_time"), MAX(o."start_time"))) - EXTRACT(EPOCH FROM MIN(o."start_time"))::DOUBLE PRECISION AS "latency",
-                ARRAY_AGG(DISTINCT o.id) FILTER (WHERE o.id IS NOT NULL) AS "observations"
-              FROM "observations_view" AS o
-              WHERE o.trace_id = t.id AND o.project_id = ${auth.scope.projectId}
-            ) AS o ON true
-            LEFT JOIN LATERAL (
-              SELECT
-                ARRAY_AGG(DISTINCT s.id) FILTER (WHERE s.id IS NOT NULL) AS "scores"
-              FROM "scores" AS s
-              WHERE s.trace_id = t.id AND s.project_id = ${auth.scope.projectId}
-            ) AS s ON true
-          `);
+        // 2. Apply default date range if configured and no fromTimestamp provided
+        const defaultDateRangeDays =
+          env.LANGFUSE_API_TRACES_DEFAULT_DATE_RANGE_DAYS;
+        let effectiveFromTimestamp = query.fromTimestamp ?? undefined;
+        if (!query.fromTimestamp && defaultDateRangeDays) {
+          const referenceDateMs = query.toTimestamp
+            ? new Date(query.toTimestamp).getTime()
+            : Date.now();
+          effectiveFromTimestamp = new Date(
+            referenceDateMs - defaultDateRangeDays * 24 * 60 * 60 * 1000,
+          ).toISOString();
+        }
 
-          const totalItems = await prisma.trace.count({
-            where: {
-              projectId: auth.scope.projectId,
-              name: query.name ? query.name : undefined,
-              userId: query.userId ? query.userId : undefined,
-              sessionId: query.sessionId ? query.sessionId : undefined,
-              version: query.version ? query.version : undefined,
-              release: query.release ? query.release : undefined,
-              timestamp: {
-                gte: query.fromTimestamp
-                  ? new Date(query.fromTimestamp)
-                  : undefined,
-                lt: query.toTimestamp ? new Date(query.toTimestamp) : undefined,
-              },
-              tags: query.tags
-                ? {
-                    hasEvery: Array.isArray(query.tags)
-                      ? query.tags
-                      : query.tags.split(","),
-                  }
-                : undefined,
-            },
-          });
+        // 3. Apply default fields if configured and no fields query param provided
+        let effectiveFields = query.fields ?? undefined;
+        if (!query.fields && env.LANGFUSE_API_TRACES_DEFAULT_FIELDS) {
+          const parsed = env.LANGFUSE_API_TRACES_DEFAULT_FIELDS.split(",")
+            .map((f) => f.trim())
+            .filter((f): f is TraceFieldGroup =>
+              TRACE_FIELD_GROUPS.includes(f as TraceFieldGroup),
+            );
+          if (parsed.length > 0) {
+            effectiveFields = parsed;
+          }
+        }
 
-          return {
-            data: traces,
-            meta: {
-              page: query.page,
-              limit: query.limit,
-              totalItems,
-              totalPages: Math.ceil(totalItems / query.limit),
-            },
-          };
-        },
-        clickhouseExecution: async () => {
-          const filterProps = {
-            projectId: auth.scope.projectId,
-            page: query.page ?? undefined,
-            limit: query.limit ?? undefined,
-            userId: query.userId ?? undefined,
-            name: query.name ?? undefined,
-            tags: query.tags ?? undefined,
-            sessionId: query.sessionId ?? undefined,
-            version: query.version ?? undefined,
-            release: query.release ?? undefined,
-            fromTimestamp: query.fromTimestamp ?? undefined,
-            toTimestamp: query.toTimestamp ?? undefined,
-          };
+        const filterProps = {
+          projectId: auth.scope.projectId,
+          page: query.page ?? undefined,
+          limit: query.limit ?? undefined,
+          fields: effectiveFields,
+          userId: query.userId ?? undefined,
+          name: query.name ?? undefined,
+          tags: query.tags ?? undefined,
+          environment: query.environment ?? undefined,
+          sessionId: query.sessionId ?? undefined,
+          version: query.version ?? undefined,
+          release: query.release ?? undefined,
+          fromTimestamp: effectiveFromTimestamp,
+          toTimestamp: query.toTimestamp ?? undefined,
+        };
 
+        if (query.useEventsTable) {
           const [items, count] = await Promise.all([
-            generateTracesForPublicApi(filterProps, query.orderBy ?? null),
-            getTracesCountForPublicApi(filterProps),
+            getTracesFromEventsTableForPublicApi({
+              ...filterProps,
+              advancedFilters: query.filter,
+              orderBy: query.orderBy ?? null,
+            }),
+            getTracesCountFromEventsTableForPublicApi({
+              ...filterProps,
+              advancedFilters: query.filter,
+            }),
           ]);
 
-          const finalCount = count || 0;
           return {
-            data: items,
+            data: items.map((item) => ({
+              ...item,
+              externalId: null,
+            })),
             meta: {
               page: query.page,
               limit: query.limit,
-              totalItems: finalCount,
-              totalPages: Math.ceil(finalCount / query.limit),
+              totalItems: count,
+              totalPages: Math.ceil(count / query.limit),
             },
           };
-        },
-      });
-    },
-  }),
-});
+        }
+
+        // Legacy code path using traces table
+        const [items, count] = await Promise.all([
+          generateTracesForPublicApi({
+            props: filterProps,
+            advancedFilters: query.filter,
+            orderBy: query.orderBy ?? null,
+          }),
+          getTracesCountForPublicApi({
+            props: filterProps,
+            advancedFilters: query.filter,
+          }),
+        ]);
+
+        const finalCount = count || 0;
+        return {
+          data: items.map((item) => ({
+            ...item,
+            externalId: null,
+          })),
+          meta: {
+            page: query.page,
+            limit: query.limit,
+            totalItems: finalCount,
+            totalPages: Math.ceil(finalCount / query.limit),
+          },
+        };
+      },
+    }),
+
+    DELETE: createAuthedProjectAPIRoute({
+      name: "Delete Multiple Traces",
+      bodySchema: DeleteTracesV1Body,
+      responseSchema: DeleteTracesV1Response,
+      rateLimitResource: "trace-delete",
+      fn: async ({ body, auth }) => {
+        const { traceIds } = body;
+
+        await Promise.all(
+          traceIds.map((traceId) =>
+            auditLog({
+              resourceType: "trace",
+              resourceId: traceId,
+              action: "delete",
+              projectId: auth.scope.projectId,
+              apiKeyId: auth.scope.apiKeyId,
+              orgId: auth.scope.orgId,
+            }),
+          ),
+        );
+
+        await traceDeletionProcessor(auth.scope.projectId, traceIds);
+
+        return { message: "Traces deleted successfully" };
+      },
+    }),
+  },
+  {
+    clickHouseResourceErrorMessage:
+      LEGACY_PUBLIC_API_OBSERVATIONS_CLICKHOUSE_RESOURCE_ERROR_MESSAGE,
+  },
+);

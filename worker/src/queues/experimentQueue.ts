@@ -1,43 +1,50 @@
 import { Job } from "bullmq";
 import {
+  ExperimentCreateQueue,
+  QueueJobs,
   QueueName,
   TQueueJobTypes,
+  classifyEvaluatorLlmError,
   logger,
   traceException,
 } from "@langfuse/shared/src/server";
-import { createExperimentJob } from "../ee/experiments/experimentService";
-import {
-  ForbiddenError,
-  InvalidRequestError,
-  LangfuseNotFoundError,
-} from "@langfuse/shared";
+import { retryLLMRateLimitError } from "../features/utils";
+import { createExperimentJobClickhouse } from "../features/experiments/experimentServiceClickhouse";
+import { isUnrecoverableError } from "../errors/UnrecoverableError";
 
 export const experimentCreateQueueProcessor = async (
   job: Job<TQueueJobTypes[QueueName.ExperimentCreate]>,
 ) => {
   try {
-    logger.info("Starting to process experiment create job", {
-      jobId: job.id,
-      attempt: job.attemptsMade,
-      data: job.data,
-    });
-    await createExperimentJob({
+    await createExperimentJobClickhouse({
       event: job.data.payload,
     });
     return true;
   } catch (e) {
-    if (
-      e instanceof ForbiddenError ||
-      e instanceof InvalidRequestError ||
-      e instanceof LangfuseNotFoundError
-    ) {
-      logger.info("Failed to process experiment create job", e);
-      // LFE-3174: improve error reporting to the user for experiment create job
-      return;
+    const llmError = classifyEvaluatorLlmError(e);
+
+    if (llmError?.isRetryable) {
+      const retryResult = await retryLLMRateLimitError(job, {
+        table: "dataset_runs",
+        idField: "runId",
+        queue: ExperimentCreateQueue.getInstance(),
+        queueName: QueueName.ExperimentCreate,
+        jobName: QueueJobs.ExperimentCreateJob,
+      });
+
+      if (retryResult.outcome === "scheduled") return;
+      if (retryResult.outcome === "queue_unavailable") throw e;
     }
 
-    logger.error("Failed to process experiment create job", e);
+    if (llmError || isUnrecoverableError(e)) return;
+
+    logger.error(
+      `Failed to process experiment create job for project: ${job.data.payload.projectId}`,
+      e,
+    );
     traceException(e);
+
+    // Retry job by rethrowing error
     throw e;
   }
 };

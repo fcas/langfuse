@@ -11,20 +11,20 @@ import {
   FormMessage,
 } from "@/src/components/ui/form";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
+import { api, reportTrpcErrorWithoutToast } from "@/src/utils/api";
 import { useSession } from "next-auth/react";
-import { organizationNameSchema } from "@/src/features/organizations/utils/organizationNameSchema";
+import { organizationFormSchema } from "@/src/features/organizations/utils/organizationNameSchema";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 
 export const NewOrganizationForm = ({
   onSuccess,
 }: {
-  onSuccess: (orgId: string) => void;
+  onSuccess: (orgId: string) => void | Promise<void>;
 }) => {
   const { update: updateSession } = useSession();
 
-  const form = useForm<z.infer<typeof organizationNameSchema>>({
-    resolver: zodResolver(organizationNameSchema),
+  const form = useForm({
+    resolver: zodResolver(organizationFormSchema),
     defaultValues: {
       name: "",
     },
@@ -34,29 +34,35 @@ export const NewOrganizationForm = ({
     onError: (error) => form.setError("name", { message: error.message }),
   });
 
-  function onSubmit(values: z.infer<typeof organizationNameSchema>) {
+  function onSubmit(values: z.infer<typeof organizationFormSchema>) {
     capture("organizations:new_form_submit");
     createOrgMutation
       .mutateAsync({
         name: values.name,
       })
-      .then((org) => {
-        void updateSession();
-        onSuccess(org.id);
+      .then(async (org) => {
+        // the setup (next step) resolves the current org from session state,
+        // so we refresh it, so that the UI doesn't render stale state.
+        // for example, it could otherwise show the v4 enable toggle.
+        await updateSession();
+        await onSuccess(org.id);
         form.reset();
       })
-      .catch((error) => {
-        console.error(error);
-      });
+      .catch((error) => reportTrpcErrorWithoutToast(error, "organizations"));
   }
 
   return (
     <Form {...form}>
       <form
-        // eslint-disable-next-line @typescript-eslint/no-misused-promises
         onSubmit={form.handleSubmit(onSubmit)}
         className="space-y-3"
         data-testid="new-org-form"
+        onKeyDown={(e) => {
+          if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+            e.preventDefault();
+            form.handleSubmit(onSubmit)();
+          }
+        }}
       >
         <FormField
           control={form.control}
@@ -75,7 +81,7 @@ export const NewOrganizationForm = ({
             </FormItem>
           )}
         />
-        <Button type="submit" loading={createOrgMutation.isLoading}>
+        <Button type="submit" loading={createOrgMutation.isPending}>
           Create
         </Button>
       </form>

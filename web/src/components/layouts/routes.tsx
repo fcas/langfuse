@@ -1,6 +1,7 @@
 import { type Flag } from "@/src/features/feature-flags/types";
-import { type ProjectScope } from "@/src/features/rbac/constants/projectAccessRights";
+import { type ProjectScope } from "@langfuse/shared";
 import {
+  BellRing,
   Database,
   LayoutDashboard,
   LifeBuoy,
@@ -8,21 +9,47 @@ import {
   type LucideIcon,
   Settings,
   UsersIcon,
-  LibraryBig,
   TerminalIcon,
   Lightbulb,
   Grid2X2,
   Sparkle,
   FileJson,
+  Search,
+  Home,
+  SquarePercent,
+  ClipboardPen,
+  Clock,
+  Beaker,
 } from "lucide-react";
 import { type ReactNode } from "react";
 import { type Entitlement } from "@/src/features/entitlements/constants/entitlements";
-import { type UiCustomizationOption } from "@/src/ee/features/ui-customization/useUiCustomization";
-import { type User } from "next-auth";
+import { type Session } from "next-auth";
 import { type OrganizationScope } from "@/src/features/rbac/constants/organizationAccessRights";
+import { SupportButton } from "@/src/components/nav/support-button";
+import { V4MigrationNavItem } from "@/src/features/v4-migration/V4MigrationNavItem";
+import { V4SidebarToggle } from "@/src/features/events/components/V4SidebarToggle";
+import { BookACallButton } from "@/src/components/nav/book-a-call-button";
+import { SidebarMenuButton } from "@/src/components/ui/sidebar";
+import { KeyboardShortcut } from "@/src/components/ui/keyboard-shortcut";
+import { useCommandMenu } from "@/src/features/command-k-menu/CommandMenuProvider";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+import { CloudStatusMenu } from "@/src/features/cloud-status-notification/components/CloudStatusMenu";
+import { type ProductModule } from "@/src/ee/features/ui-customization/productModuleSchema";
+
+export enum RouteSection {
+  Main = "main",
+  Secondary = "secondary",
+}
+
+export enum RouteGroup {
+  Observability = "Observability",
+  PromptManagement = "Prompt Management",
+  Evaluation = "Evaluation",
+}
 
 export type Route = {
   title: string;
+  menuNode?: ReactNode;
   featureFlag?: Flag;
   label?: string | ReactNode;
   projectRbacScopes?: ProjectScope[]; // array treated as OR
@@ -30,108 +57,151 @@ export type Route = {
   icon?: LucideIcon; // ignored for nested routes
   pathname: string; // link
   items?: Array<Route>; // folder
-  bottom?: boolean; // bottom of the sidebar, only for first level routes
+  section?: RouteSection; // which section of the sidebar (top/main/bottom)
   newTab?: boolean; // open in new tab
   entitlements?: Entitlement[]; // entitlements required, array treated as OR
-  customizableHref?: UiCustomizationOption; // key of useUiCustomization object to use to replace the href
+  productModule?: ProductModule; // Product module this route belongs to. Used to show/hide modules via ui customization.
   show?: (p: {
-    organization: User["organizations"][number] | undefined;
+    organization:
+      | NonNullable<Session["user"]>["organizations"][number]
+      | undefined;
+    projectId: string | undefined;
+    isLangfuseCloud: boolean;
+    v4WriteMode: undefined | "legacy" | "dual" | "events_only"; // undefined until the session has loaded
   }) => boolean;
+  group?: RouteGroup; // group this route belongs to (within a section)
 };
 
 export const ROUTES: Route[] = [
+  {
+    title: "Go to...",
+    pathname: "", // Empty pathname since this is a dropdown
+    icon: Search,
+    menuNode: <CommandMenuTrigger />,
+    section: RouteSection.Main,
+  },
   {
     title: "Organizations",
     pathname: "/",
     icon: Grid2X2,
     show: ({ organization }) => organization === undefined,
+    section: RouteSection.Main,
   },
   {
     title: "Projects",
     pathname: "/organization/[organizationId]",
     icon: Grid2X2,
+    section: RouteSection.Main,
   },
   {
-    title: "Dashboard",
+    title: "Home",
     pathname: `/project/[projectId]`,
+    icon: Home,
+    section: RouteSection.Main,
+  },
+  {
+    title: "Dashboards",
+    pathname: `/project/[projectId]/dashboards`,
     icon: LayoutDashboard,
+    productModule: "dashboards",
+    section: RouteSection.Main,
   },
   {
     title: "Tracing",
-    pathname: `/project/[projectId]/traces`,
     icon: ListTree,
-    items: [
-      {
-        title: "Traces",
-        pathname: `/project/[projectId]/traces`,
-      },
-      {
-        title: "Sessions",
-        pathname: `/project/[projectId]/sessions`,
-      },
-      {
-        title: "Generations",
-        pathname: `/project/[projectId]/generations`,
-      },
-      {
-        title: "Scores",
-        pathname: `/project/[projectId]/scores`,
-      },
-      {
-        title: "Models",
-        pathname: `/project/[projectId]/models`,
-      },
-    ],
+    productModule: "tracing",
+    group: RouteGroup.Observability,
+    section: RouteSection.Main,
+    pathname: `/project/[projectId]/traces`,
   },
   {
-    title: "Evaluation",
-    icon: Lightbulb,
-    pathname: `/project/[projectId]/annotation-queues`,
-    label: "Beta",
-    entitlements: ["annotation-queues", "model-based-evaluations"],
-    projectRbacScopes: ["annotationQueues:read", "evalJob:read"],
-    items: [
-      {
-        title: "Human Annotation",
-        pathname: `/project/[projectId]/annotation-queues`,
-        projectRbacScopes: ["annotationQueues:read"],
-        entitlements: ["annotation-queues"],
-      },
-      {
-        title: "LLM-as-a-Judge",
-        pathname: `/project/[projectId]/evals`,
-        entitlements: ["model-based-evaluations"],
-        projectRbacScopes: ["evalJob:read"],
-      },
-    ],
+    title: "Sessions",
+    icon: Clock,
+    productModule: "tracing",
+    group: RouteGroup.Observability,
+    section: RouteSection.Main,
+    pathname: `/project/[projectId]/sessions`,
   },
   {
     title: "Users",
     pathname: `/project/[projectId]/users`,
     icon: UsersIcon,
+    productModule: "tracing",
+    group: RouteGroup.Observability,
+    section: RouteSection.Main,
+  },
+  {
+    title: "Alerts",
+    pathname: "/project/[projectId]/alerts",
+    icon: BellRing,
+    projectRbacScopes: ["alerts:read"],
+    show: ({ v4WriteMode }) => Boolean(v4WriteMode) && v4WriteMode !== "legacy",
+    group: RouteGroup.Observability,
+    section: RouteSection.Main,
   },
   {
     title: "Prompts",
     pathname: "/project/[projectId]/prompts",
     icon: FileJson,
     projectRbacScopes: ["prompts:read"],
+    productModule: "prompt-management",
+    group: RouteGroup.PromptManagement,
+    section: RouteSection.Main,
   },
   {
     title: "Playground",
     pathname: "/project/[projectId]/playground",
     icon: TerminalIcon,
-    entitlements: ["playground"],
+    productModule: "playground",
+    group: RouteGroup.PromptManagement,
+    section: RouteSection.Main,
+  },
+  {
+    title: "Scores",
+    pathname: `/project/[projectId]/scores`,
+    group: RouteGroup.Evaluation,
+    section: RouteSection.Main,
+    icon: SquarePercent,
+  },
+  {
+    title: "Evaluators",
+    icon: Lightbulb,
+    productModule: "evaluation",
+    projectRbacScopes: ["evalJob:read"],
+    group: RouteGroup.Evaluation,
+    section: RouteSection.Main,
+    pathname: `/project/[projectId]/evals`,
+  },
+  {
+    title: "Human Annotation",
+    pathname: `/project/[projectId]/annotation-queues`,
+    projectRbacScopes: ["annotationQueues:read"],
+    group: RouteGroup.Evaluation,
+    section: RouteSection.Main,
+    icon: ClipboardPen,
   },
   {
     title: "Datasets",
     pathname: `/project/[projectId]/datasets`,
     icon: Database,
+    productModule: "datasets",
+    projectRbacScopes: ["datasets:read"],
+    group: RouteGroup.Evaluation,
+    section: RouteSection.Main,
+  },
+  {
+    title: "Experiments",
+    pathname: `/project/[projectId]/experiments`,
+    icon: Beaker,
+    featureFlag: "experimentsV4Enabled",
+    group: RouteGroup.Evaluation,
+    section: RouteSection.Main,
   },
   {
     title: "Upgrade",
     icon: Sparkle,
     pathname: "/project/[projectId]/settings/billing",
-    bottom: true,
+    section: RouteSection.Secondary,
     entitlements: ["cloud-billing"],
     organizationRbacScope: "langfuseCloudBilling:CRUD",
     show: ({ organization }) => organization?.plan === "cloud:hobby",
@@ -140,36 +210,79 @@ export const ROUTES: Route[] = [
     title: "Upgrade",
     icon: Sparkle,
     pathname: "/organization/[organizationId]/settings/billing",
-    bottom: true,
+    section: RouteSection.Secondary,
     entitlements: ["cloud-billing"],
     organizationRbacScope: "langfuseCloudBilling:CRUD",
     show: ({ organization }) => organization?.plan === "cloud:hobby",
   },
   {
+    title: "Cloud Status",
+    section: RouteSection.Secondary,
+    pathname: "",
+    menuNode: <CloudStatusMenu />,
+  },
+  {
+    title: "Update",
+    pathname: "",
+    section: RouteSection.Secondary,
+    featureFlag: "v4UpgradeUi",
+    show: ({ projectId }) => projectId !== undefined,
+    menuNode: <V4MigrationNavItem />,
+  },
+  {
+    title: "V4 Preview",
+    pathname: "",
+    section: RouteSection.Secondary,
+    featureFlag: "v4BetaToggleVisible",
+    menuNode: <V4SidebarToggle />,
+  },
+  {
     title: "Settings",
     pathname: "/project/[projectId]/settings",
     icon: Settings,
-    bottom: true,
+    section: RouteSection.Secondary,
   },
   {
     title: "Settings",
     pathname: "/organization/[organizationId]/settings",
     icon: Settings,
-    bottom: true,
+    section: RouteSection.Secondary,
   },
   {
-    title: "Docs",
-    pathname: "https://langfuse.com/docs",
-    icon: LibraryBig,
-    bottom: true,
-    newTab: true,
-    customizableHref: "documentationHref",
+    title: "Book a call",
+    section: RouteSection.Secondary,
+    pathname: "",
+    menuNode: <BookACallButton />,
   },
   {
     title: "Support",
-    pathname: "/support",
     icon: LifeBuoy,
-    bottom: true,
-    customizableHref: "supportHref",
+    section: RouteSection.Secondary,
+    pathname: "", // Empty pathname since this is a dropdown
+    menuNode: <SupportButton />,
   },
 ];
+
+function CommandMenuTrigger() {
+  const { setOpen } = useCommandMenu();
+  const capture = usePostHogClientCapture();
+
+  return (
+    <SidebarMenuButton
+      onClick={() => {
+        capture("cmd_k_menu:opened", {
+          source: "main_navigation",
+        });
+        setOpen(true);
+      }}
+      className="whitespace-nowrap"
+    >
+      <Search className="h-4 w-4" />
+      Go to...
+      <KeyboardShortcut
+        className="ml-auto"
+        keys={[navigator.userAgent.includes("Mac") ? "⌘" : "Ctrl", "K"]}
+      />
+    </SidebarMenuButton>
+  );
+}

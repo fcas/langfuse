@@ -1,16 +1,22 @@
+/* eslint-disable @repo/no-abstracted-overlay-trigger */
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
+  DropdownMenuPortal,
+  DropdownMenuSeparator,
+  DropdownMenuLabel,
 } from "@/src/components/ui/dropdown-menu";
 import { Button } from "@/src/components/ui/button";
-import { ChevronDownIcon, Loader } from "lucide-react";
+import Spinner from "@/src/components/design-system/Spinner/Spinner";
+import { Download, Info } from "lucide-react";
 import {
   type BatchExportTableName,
   exportOptions,
   type BatchExportFileFormat,
   type OrderByState,
+  BatchTableNames,
 } from "@langfuse/shared";
 import React from "react";
 import { api } from "@/src/utils/api";
@@ -23,6 +29,7 @@ export type BatchExportTableButtonProps = {
   orderByState: OrderByState;
   filterState: any;
   searchQuery?: any;
+  searchType?: any;
 };
 
 export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
@@ -59,6 +66,8 @@ export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
       query: {
         tableName: props.tableName,
         filter: props.filterState,
+        searchQuery: props.searchQuery || undefined,
+        searchType: props.searchType || undefined,
         orderBy: props.orderByState,
       },
     });
@@ -66,34 +75,60 @@ export const BatchExportTableButton: React.FC<BatchExportTableButtonProps> = (
 
   if (!hasAccess) return null;
 
+  const getWarningMessage = () => {
+    switch (props.tableName) {
+      case BatchTableNames.Traces:
+        return "Note: Filters on observation-level columns (Level, Tokens, Cost, Latency) and Comments are not included in trace exports. You may receive more data than expected.";
+      case BatchTableNames.Observations:
+        return "Note: Filters on trace-level columns (Trace Name, Trace Tags, User ID, Trace Environment) and Comments are not included in observation exports. You may receive more data than expected.";
+      case BatchTableNames.Events:
+        return "Note: Filters on Comments are not included in event exports. You may receive more data than expected.";
+      case BatchTableNames.Sessions:
+        return "Note: Filters on Comments are not included in session exports. You may receive more data than expected.";
+      case BatchTableNames.AuditLogs:
+        return "Note: Filters are not applied to audit log exports. All audit logs for this project will be exported.";
+      default:
+        // Note: for Scores, DatasetRunItems, DatasetItems, filters should work as expected
+        return null;
+    }
+  };
+
+  const warningMessage = getWarningMessage();
+
   return (
     <DropdownMenu>
       <DropdownMenuTrigger asChild>
-        <Button variant="outline" className="ml-auto whitespace-nowrap">
-          <span className="hidden @6xl:inline">
-            {props.filterState.length > 0 || props.searchQuery
-              ? "Export selection"
-              : "Export all"}{" "}
-          </span>
-          <span className="@6xl:hidden">Export</span>
+        <Button variant="outline" size="icon" title="Export">
           {isExporting ? (
-            <Loader className="ml-2 h-4 w-4 animate-spin" />
+            <Spinner size="sm" />
           ) : (
-            <ChevronDownIcon className="ml-2 h-4 w-4" />
+            <Download className="h-4 w-4" />
           )}
         </Button>
       </DropdownMenuTrigger>
-      <DropdownMenuContent align="end">
-        {Object.entries(exportOptions).map(([key, options]) => (
-          <DropdownMenuItem
-            key={key}
-            className="capitalize"
-            onClick={() => void handleExport(key as BatchExportFileFormat)}
-          >
-            as {options.label}
-          </DropdownMenuItem>
-        ))}
-      </DropdownMenuContent>
+      <DropdownMenuPortal>
+        <DropdownMenuContent className="w-80">
+          <DropdownMenuLabel>Export</DropdownMenuLabel>
+          {warningMessage && (
+            <div className="text-muted-foreground px-2 py-1.5 text-xs">
+              <div className="flex items-start gap-1.5">
+                <Info className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>{warningMessage}</span>
+              </div>
+            </div>
+          )}
+          <DropdownMenuSeparator />
+          {Object.entries(exportOptions).map(([key, options]) => (
+            <DropdownMenuItem
+              key={key}
+              className="capitalize"
+              onClick={() => handleExport(key as BatchExportFileFormat)}
+            >
+              as {options.label}
+            </DropdownMenuItem>
+          ))}
+        </DropdownMenuContent>
+      </DropdownMenuPortal>
     </DropdownMenu>
   );
 };

@@ -1,43 +1,10 @@
-import {
-  CommentObjectType,
-  type PrismaClient,
-  type CreateCommentData,
-} from "@langfuse/shared";
+import { CommentObjectType, type CreateCommentData } from "@langfuse/shared";
 import { type z } from "zod";
-import { getObservationById, getTraceById } from "@langfuse/shared/src/server";
-
-type PrismaModelName = keyof Omit<
-  PrismaClient,
-  | "$connect"
-  | "$disconnect"
-  | "$on"
-  | "$transaction"
-  | "$use"
-  | "$extends"
-  | "$executeRaw"
-  | "$executeRawUnsafe"
-  | "$queryRaw"
-  | "$queryRawUnsafe"
-  | "$metrics"
-  | symbol
->;
-
-const COMMENT_OBJECT_TYPE_TO_PRISMA_MODEL: Record<
-  CommentObjectType,
-  PrismaModelName
-> = {
-  [CommentObjectType.TRACE]: "trace",
-  [CommentObjectType.OBSERVATION]: "observation",
-  [CommentObjectType.SESSION]: "traceSession",
-  [CommentObjectType.PROMPT]: "prompt",
-} as const;
-
-const isObservationOrTrace = (objectType: CommentObjectType) => {
-  return (
-    objectType === CommentObjectType.OBSERVATION ||
-    objectType === CommentObjectType.TRACE
-  );
-};
+import {
+  getObservationById,
+  getTraceById,
+  getTracesIdentifierForSession,
+} from "@langfuse/shared/src/server";
 
 export const validateCommentReferenceObject = async ({
   ctx,
@@ -48,41 +15,48 @@ export const validateCommentReferenceObject = async ({
 }): Promise<{ errorMessage?: string }> => {
   const { objectId, objectType, projectId } = input;
 
-  if (isObservationOrTrace(objectType)) {
-    let clickhouseObject;
-    if (objectType === CommentObjectType.OBSERVATION) {
-      clickhouseObject = await getObservationById(objectId, projectId);
-    } else {
-      clickhouseObject = await getTraceById(objectId, projectId);
-    }
-
-    return !!clickhouseObject
-      ? {}
-      : {
-          errorMessage: `Reference object, ${objectType}: ${objectId} not found in Clickhouse. Skipping creating comment.`,
-        };
-  } else {
-    const prismaModel = COMMENT_OBJECT_TYPE_TO_PRISMA_MODEL[objectType];
-
-    if (!prismaModel) {
-      return {
-        errorMessage: `No prisma model for object type ${objectType}`,
-      };
-    }
-
-    const model = ctx.prisma[prismaModel];
-    const object = await model.findFirst({
-      where: {
+  let commentTarget;
+  switch (objectType) {
+    case CommentObjectType.OBSERVATION: {
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
+      commentTarget = await getObservationById({
         id: objectId,
         projectId,
-      },
-    });
-
-    if (!object) {
-      return {
-        errorMessage: `No ${prismaModel} with id ${objectId} in project ${projectId}`,
-      };
+      });
+      break;
     }
-    return {};
+    case CommentObjectType.TRACE: {
+      // eslint-disable-next-line @typescript-eslint/no-deprecated
+      commentTarget = await getTraceById({
+        traceId: objectId,
+        projectId,
+      });
+      break;
+    }
+    case CommentObjectType.SESSION: {
+      commentTarget =
+        // eslint-disable-next-line @typescript-eslint/no-deprecated
+        (await getTracesIdentifierForSession(projectId, objectId)).shift();
+      break;
+    }
+    case CommentObjectType.PROMPT: {
+      commentTarget = await ctx.prisma.prompt.findFirst({
+        where: {
+          id: objectId,
+          projectId,
+        },
+      });
+      break;
+    }
+    default: {
+      const _exhaustiveCheck: never = objectType;
+      throw new Error(`Invalid object type for comment: ${objectType}`);
+    }
   }
+
+  return Boolean(commentTarget)
+    ? {}
+    : {
+        errorMessage: `Reference object, ${objectType}: ${objectId} not found. Skipping comment creation.`,
+      };
 };

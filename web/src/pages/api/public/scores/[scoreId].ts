@@ -1,53 +1,36 @@
-import { env } from "@/src/env.mjs";
-import { createAuthedAPIRoute } from "@/src/features/public-api/server/createAuthedAPIRoute";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
 import {
-  DeleteScoreQuery,
-  DeleteScoreResponse,
-  GetScoreQuery,
-  GetScoreResponse,
+  DeleteScoreQueryV1,
+  DeleteScoreResponseV1,
+  GetScoreQueryV1,
+  GetScoreResponseV1,
   InternalServerError,
   LangfuseNotFoundError,
 } from "@langfuse/shared";
-import { prisma } from "@langfuse/shared/src/db";
-import {
-  deleteScore,
-  getScoreById,
-  logger,
-  traceException,
-} from "@langfuse/shared/src/server";
+import { logger, traceException } from "@langfuse/shared/src/server";
+import { ScoresApiService } from "@/src/features/public-api/server/scores-api-service";
+import { SCORES_DEPRECATION } from "@/src/features/public-api/server/deprecations";
 
 export default withMiddlewares({
-  GET: createAuthedAPIRoute({
+  GET: createAuthedProjectAPIRoute({
     name: "Get Score",
-    querySchema: GetScoreQuery,
-    responseSchema: GetScoreResponse,
+    querySchema: GetScoreQueryV1,
+    responseSchema: GetScoreResponseV1,
+    deprecation: SCORES_DEPRECATION,
+    rejectInEventsOnlyMode: true,
     fn: async ({ query, auth }) => {
-      const { scoreId } = query;
-
-      const score = await measureAndReturnApi({
-        input: { projectId: auth.scope.projectId, queryClickhouse: false },
-        operation: "api/public/scores/[scoreId]",
-        user: null,
-        pgExecution: async () => {
-          return await prisma.score.findUnique({
-            where: {
-              id: scoreId,
-              projectId: auth.scope.projectId,
-            },
-          });
-        },
-        clickhouseExecution: async () => {
-          return await getScoreById(auth.scope.projectId, scoreId);
-        },
+      const scoresApiService = new ScoresApiService("v1");
+      const score = await scoresApiService.getScoreById({
+        projectId: auth.scope.projectId,
+        scoreId: query.scoreId,
       });
 
       if (!score) {
         throw new LangfuseNotFoundError("Score not found");
       }
 
-      const parsedScore = GetScoreResponse.safeParse(score);
+      const parsedScore = GetScoreResponseV1.safeParse(score);
 
       if (!parsedScore.success) {
         traceException(parsedScore.error);
@@ -58,41 +41,22 @@ export default withMiddlewares({
       return parsedScore.data;
     },
   }),
-  DELETE: createAuthedAPIRoute({
+  DELETE: createAuthedProjectAPIRoute({
     name: "Delete Score",
-    querySchema: DeleteScoreQuery,
-    responseSchema: DeleteScoreResponse,
+    querySchema: DeleteScoreQueryV1,
+    responseSchema: DeleteScoreResponseV1,
+    rateLimitResource: "score-delete",
+    successStatusCode: 202,
     fn: async ({ query, auth }) => {
       const { scoreId } = query;
 
-      const score = await prisma.score.findUnique({
-        select: {
-          id: true,
-        },
-        where: {
-          id: scoreId,
-          projectId: auth.scope.projectId,
-        },
+      const scoresApiService = new ScoresApiService("v1");
+      return await scoresApiService.deleteScore({
+        scoreId,
+        projectId: auth.scope.projectId,
+        orgId: auth.scope.orgId,
+        apiKeyId: auth.scope.apiKeyId,
       });
-
-      if (!score) {
-        throw new LangfuseNotFoundError(
-          "Score not found within authorized project",
-        );
-      }
-
-      if (env.CLICKHOUSE_URL) {
-        await deleteScore(auth.scope.projectId, scoreId);
-      }
-
-      await prisma.score.delete({
-        where: {
-          id: scoreId,
-          projectId: auth.scope.projectId,
-        },
-      });
-
-      return { message: "Score deleted successfully" };
     },
   }),
 });

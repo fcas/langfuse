@@ -1,17 +1,19 @@
-import {
-  JsonNested,
-  convertRecordToJsonSchema,
-  mergeJson,
-} from "@langfuse/shared";
-import { mergeWith } from "lodash";
+import { JsonNested, Prisma } from "@langfuse/shared";
+import { mergeWith, merge } from "lodash";
 
+// Theoretically this returns Record<string, unknown>, but it would be hard to align the typing accordingly.
+// It's easier to pretend here and let JavaScript do its magic.
 export const convertJsonSchemaToRecord = (
   jsonSchema: JsonNested,
 ): Record<string, string> => {
   const record: Record<string, string> = {};
 
   // if it's a literal, return the value with "metadata" prefix
-  if (typeof jsonSchema === "string" || typeof jsonSchema === "number") {
+  if (
+    typeof jsonSchema === "string" ||
+    typeof jsonSchema === "number" ||
+    typeof jsonSchema === "boolean"
+  ) {
     record["metadata"] = jsonSchema.toString();
     return record;
   }
@@ -22,25 +24,37 @@ export const convertJsonSchemaToRecord = (
     return record;
   }
 
-  if (typeof jsonSchema === "object") {
-    for (const key in jsonSchema) {
-      const value = jsonSchema[key];
-      record[key] = typeof value === "string" ? value : JSON.stringify(value);
-    }
-  }
-  return record;
+  return jsonSchema as Record<string, string>;
 };
 
-const mergeRecords = (
-  record1?: Record<string, string>,
-  record2?: Record<string, string>,
-): Record<string, string> | undefined => {
-  const merged = mergeJson(
-    record1 ? (convertRecordToJsonSchema(record1) ?? undefined) : undefined,
-    record2 ? (convertRecordToJsonSchema(record2) ?? undefined) : undefined,
-  );
+export const convertPostgresJsonToMetadataRecord = (
+  metadata: Prisma.JsonValue,
+): Record<string, string> => {
+  if (
+    typeof metadata === "string" ||
+    typeof metadata === "number" ||
+    typeof metadata === "boolean"
+  ) {
+    return { metadata: String(metadata) };
+  }
+  if (Array.isArray(metadata)) {
+    return { metadata: JSON.stringify(metadata) };
+  }
+  if (metadata && typeof metadata === "object") {
+    return convertRecordValuesToString(metadata as Record<string, unknown>);
+  }
+  return {};
+};
 
-  return merged ? convertJsonSchemaToRecord(merged) : undefined;
+export const convertRecordValuesToString = (
+  record: Record<string, unknown>,
+): Record<string, string> => {
+  const result: Record<string, string> = {};
+  for (const key in record) {
+    const value = record[key];
+    result[key] = typeof value === "string" ? value : JSON.stringify(value);
+  }
+  return result;
 };
 
 export function overwriteObject(
@@ -59,13 +73,15 @@ export function overwriteObject(
   const result = mergeWith({}, a, b, (objValue, srcValue, key) => {
     if (
       nonOverwritableKeys.includes(key) ||
-      srcValue == null ||
-      (typeof srcValue === "object" && Object.keys(srcValue).length === 0) // empty object check for cost / usage details
+      srcValue === undefined ||
+      (typeof srcValue === "object" &&
+        srcValue !== null &&
+        Object.keys(srcValue).length === 0) // empty object check for cost / usage details
     ) {
       return objValue;
-    } else {
-      return srcValue;
     }
+
+    return srcValue;
   });
 
   result.metadata =
@@ -73,7 +89,7 @@ export function overwriteObject(
       ? b.metadata
       : !b.metadata && a.metadata
         ? a.metadata
-        : (mergeRecords(a.metadata, b.metadata) ?? {});
+        : (merge(a.metadata, b.metadata) ?? {});
 
   if ("tags" in result) {
     result.tags = Array.from(

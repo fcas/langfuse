@@ -10,341 +10,413 @@ import { Prisma, CreateCommentData, DeleteCommentData } from "@langfuse/shared";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
 import { TRPCError } from "@trpc/server";
 import { validateCommentReferenceObject } from "@/src/features/comments/validateCommentReferenceObject";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
-import { getTracesIdentifierForSession } from "@langfuse/shared/src/server";
+import {
+  getTracesIdentifierForSession,
+  getTracesIdentifierForSessionFromEvents,
+  logger,
+  NotificationQueue,
+  QueueJobs,
+} from "@langfuse/shared/src/server";
+import { getUserProjectRoles } from "@langfuse/shared/src/server";
+import {
+  extractUniqueMentionedUserIds,
+  sanitizeMentions,
+} from "@/src/features/comments/lib/mentionParser";
 
 export const commentsRouter = createTRPCRouter({
   create: protectedProjectProcedure
     .input(CreateCommentData)
     .mutation(async ({ input, ctx }) => {
-      try {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "comments:CUD",
+      });
+
+      const result = await validateCommentReferenceObject({
+        ctx,
+        input,
+      });
+
+      if (result.errorMessage) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: result.errorMessage,
+        });
+      }
+
+      // Extract mentions from content (server-side, authoritative)
+      const mentionedUserIds = extractUniqueMentionedUserIds(input.content);
+
+      // Sanitize mentions
+      let sanitizedContent = input.content;
+      let validMentionedUserIds: string[] = [];
+
+      if (mentionedUserIds.length > 0) {
+        // Check projectMembers:read permission if mentioning users
         throwIfNoProjectAccess({
           session: ctx.session,
           projectId: input.projectId,
-          scope: "comments:CUD",
+          scope: "projectMembers:read",
+          forbiddenErrorMessage:
+            "You need projectMembers:read permission to mention users in comments",
         });
 
-        const result = await validateCommentReferenceObject({
-          ctx,
-          input,
+        // Fetch only the mentioned users - more efficient than fetching all project members
+        const projectMembers = await getUserProjectRoles({
+          projectId: input.projectId,
+          orgId: ctx.session.orgId,
+          searchFilter: Prisma.empty,
+          filterCondition: [
+            {
+              column: "userId",
+              operator: "any of",
+              value: mentionedUserIds,
+              type: "stringOptions",
+            },
+          ],
+          orderBy: Prisma.empty,
         });
 
-        if (result.errorMessage) {
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: result.errorMessage,
-          });
-        }
-
-        const comment = await ctx.prisma.comment.create({
-          data: {
-            projectId: input.projectId,
-            content: input.content,
-            objectId: input.objectId,
-            objectType: input.objectType,
-            authorUserId: ctx.session.user.id,
-          },
-        });
-
-        await auditLog({
-          session: ctx.session,
-          resourceType: "comment",
-          resourceId: comment.id,
-          action: "create",
-          after: comment,
-        });
-
-        return comment;
-      } catch (error) {
-        console.error(error);
-        if (error instanceof TRPCError) {
-          throw error;
-        }
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Creating comment failed.",
-        });
+        // Sanitize content: validate users and normalize display names
+        const sanitizationResult = sanitizeMentions(
+          input.content,
+          projectMembers,
+        );
+        sanitizedContent = sanitizationResult.sanitizedContent;
+        validMentionedUserIds = sanitizationResult.validMentionedUserIds;
       }
+
+      // Create comment with sanitized content
+      const comment = await ctx.prisma.comment.create({
+        data: {
+          projectId: input.projectId,
+          content: sanitizedContent, // Use sanitized content
+          objectId: input.objectId,
+          objectType: input.objectType,
+          authorUserId: ctx.session.user.id,
+          dataField: input.dataField ?? null,
+          path: input.path ?? [],
+          rangeStart: input.rangeStart ?? [],
+          rangeEnd: input.rangeEnd ?? [],
+        },
+      });
+
+      await auditLog({
+        session: ctx.session,
+        resourceType: "comment",
+        resourceId: comment.id,
+        action: "create",
+        after: comment,
+      });
+
+      // Enqueue notification job for mentioned users
+      if (validMentionedUserIds.length > 0) {
+        const notificationQueue = NotificationQueue.getInstance();
+        if (notificationQueue) {
+          try {
+            await notificationQueue.add(QueueJobs.NotificationJob, {
+              timestamp: new Date(),
+              id: comment.id,
+              payload: {
+                type: "COMMENT_MENTION" as const,
+                commentId: comment.id,
+                projectId: input.projectId,
+                mentionedUserIds: validMentionedUserIds,
+              },
+              name: QueueJobs.NotificationJob,
+            });
+            logger.info(
+              `Notification job enqueued for comment ${comment.id} with ${validMentionedUserIds.length} mentions`,
+            );
+          } catch (error) {
+            // Log but don't fail the request if notification queueing fails
+            logger.error("Failed to enqueue notification job", error);
+          }
+        }
+      }
+      return comment;
     }),
   delete: protectedProjectProcedure
     .input(DeleteCommentData)
     .mutation(async ({ input, ctx }) => {
-      try {
-        throwIfNoProjectAccess({
-          session: ctx.session,
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "comments:CUD",
+      });
+
+      const comment = await ctx.prisma.comment.findFirst({
+        where: {
+          id: input.commentId,
           projectId: input.projectId,
-          scope: "comments:CUD",
-        });
-
-        const comment = await ctx.prisma.comment.findFirst({
-          where: {
-            id: input.commentId,
-            projectId: input.projectId,
-            objectId: input.objectId,
-            objectType: input.objectType,
-          },
-        });
-        if (!comment) {
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "No comment with this id in this project.",
-          });
-        }
-
-        if (comment.authorUserId !== ctx.session.user.id) {
-          throw new TRPCError({
-            code: "NOT_FOUND",
-            message: "Comment author user id does not match provided user id",
-          });
-        }
-
-        await ctx.prisma.comment.delete({
-          where: {
-            id: comment.id,
-            projectId: comment.projectId,
-            objectId: comment.objectId,
-            objectType: comment.objectType,
-          },
-        });
-
-        await auditLog({
-          session: ctx.session,
-          resourceType: "comment",
-          resourceId: comment.id,
-          action: "delete",
-          before: comment,
-        });
-      } catch (error) {
-        console.error(error);
-        if (error instanceof TRPCError) {
-          throw error;
-        }
+          objectId: input.objectId,
+          objectType: input.objectType,
+        },
+      });
+      if (!comment) {
         throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Deleting comment failed.",
+          code: "NOT_FOUND",
+          message: "No comment with this id in this project.",
         });
       }
+
+      if (comment.authorUserId !== ctx.session.user.id) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Comment author user id does not match provided user id",
+        });
+      }
+
+      await ctx.prisma.comment.delete({
+        where: {
+          id: comment.id,
+          projectId: comment.projectId,
+          objectId: comment.objectId,
+          objectType: comment.objectType,
+        },
+      });
+
+      await auditLog({
+        session: ctx.session,
+        resourceType: "comment",
+        resourceId: comment.id,
+        action: "delete",
+        before: comment,
+      });
     }),
   getByObjectId: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
         objectId: z.string(),
-        objectType: z.nativeEnum(CommentObjectType),
+        objectType: z.enum(CommentObjectType),
       }),
     )
     .query(async ({ input, ctx }) => {
-      try {
-        throwIfNoProjectAccess({
-          session: ctx.session,
-          projectId: input.projectId,
-          scope: "comments:read",
-        });
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "comments:read",
+      });
 
-        const comments = await ctx.prisma.$queryRaw<
-          Array<{
-            id: string;
-            content: string;
-            createdAt: Date;
-            authorUserId: string | null;
-            authorUserImage: string | null;
-            authorUserName: string | null;
-          }>
-        >(
-          Prisma.sql`
+      // For single object view, we want DESC order (most recent first)
+      const comments = await ctx.prisma.$queryRaw<
+        Array<{
+          id: string;
+          content: string;
+          createdAt: Date;
+          updatedAt: Date;
+          authorUserId: string | null;
+          authorUserImage: string | null;
+          authorUserName: string | null;
+          dataField: string | null;
+          path: string[];
+          rangeStart: number[];
+          rangeEnd: number[];
+        }>
+      >(
+        Prisma.sql`
         SELECT
-          c.id, 
-          c.content, 
+          c.id,
+          c.content,
           c.created_at AS "createdAt",
+          c.updated_at AS "updatedAt",
+          c.data_field AS "dataField",
+          c.path,
+          c.range_start AS "rangeStart",
+          c.range_end AS "rangeEnd",
           u.id AS "authorUserId",
-          u.image AS "authorUserImage", 
+          u.image AS "authorUserImage",
           u.name AS "authorUserName"
         FROM comments c
-        LEFT JOIN users u ON u.id = c.author_user_id AND u.id in (SELECT user_id FROM organization_memberships WHERE org_id = ${ctx.session.orgId})
-        WHERE 
+        LEFT JOIN users u ON u.id = c.author_user_id
+        WHERE
           c."project_id" = ${input.projectId}
           AND c."object_id" = ${input.objectId}
           AND c."object_type"::text = ${input.objectType}
-        ORDER BY 
+        ORDER BY
           c.created_at DESC
         `,
-        );
+      );
 
-        return comments;
-      } catch (error) {
-        console.error(error);
-        if (error instanceof TRPCError) {
-          throw error;
-        }
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Fetching comments by object id failed.",
-        });
-      }
+      return comments;
     }),
   getCountByObjectId: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
         objectId: z.string(),
-        objectType: z.nativeEnum(CommentObjectType),
+        objectType: z.enum(CommentObjectType),
       }),
     )
     .query(async ({ input, ctx }) => {
-      try {
-        throwIfNoProjectAccess({
-          session: ctx.session,
-          projectId: input.projectId,
-          scope: "comments:read",
-        });
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "comments:read",
+      });
 
-        const commentCount = await ctx.prisma.comment.count({
-          where: {
-            projectId: input.projectId,
-            objectId: input.objectId,
-            objectType: input.objectType,
-          },
-        });
-        return new Map([[input.objectId, commentCount]]);
-      } catch (error) {
-        console.error(error);
-        if (error instanceof TRPCError) {
-          throw error;
-        }
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Fetching comment count by object id failed.",
-        });
-      }
+      const commentCount = await ctx.prisma.comment.count({
+        where: {
+          projectId: input.projectId,
+          objectId: input.objectId,
+          objectType: input.objectType,
+        },
+      });
+      return new Map([[input.objectId, commentCount]]);
     }),
   getCountByObjectType: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
-        objectType: z.nativeEnum(CommentObjectType),
+        objectType: z.enum(CommentObjectType),
       }),
     )
     .query(async ({ input, ctx }) => {
-      try {
-        throwIfNoProjectAccess({
-          session: ctx.session,
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "comments:read",
+      });
+
+      // latency of query to be improved
+      const commentCounts = await ctx.prisma.comment.groupBy({
+        by: ["objectId"],
+        where: {
           projectId: input.projectId,
-          scope: "comments:read",
-        });
+          objectType: input.objectType,
+        },
+        _count: {
+          objectId: true,
+        },
+      });
 
-        // latency of query to be improved
-        const commentCounts = await ctx.prisma.comment.groupBy({
-          by: ["objectId"],
-          where: {
-            projectId: input.projectId,
-            objectType: input.objectType,
-          },
-          _count: {
-            objectId: true,
-          },
-        });
-
-        return new Map(
-          commentCounts.map(({ objectId, _count }) => [
-            objectId,
-            _count.objectId,
-          ]),
-        );
-      } catch (error) {
-        console.error(error);
-        if (error instanceof TRPCError) {
-          throw error;
-        }
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Fetching comment count by object type failed.",
-        });
-      }
+      return new Map(
+        commentCounts.map(({ objectId, _count }) => [
+          objectId,
+          _count.objectId,
+        ]),
+      );
     }),
   getTraceCommentCountsBySessionId: protectedProjectProcedure
     .input(
       z.object({
         projectId: z.string(),
         sessionId: z.string(),
-        queryClickhouse: z.boolean().default(false),
       }),
     )
     .query(async ({ input, ctx }) => {
-      try {
-        return await measureAndReturnApi({
-          input,
-          operation: "comments.getTraceCommentCountsBySessionId",
-          user: ctx.session.user ?? undefined,
-          pgExecution: async () => {
-            const session = await ctx.prisma.traceSession.findFirst({
-              where: {
-                id: input.sessionId,
-                projectId: input.projectId,
-              },
-              include: {
-                traces: {
-                  select: {
-                    id: true,
-                  },
-                },
-              },
-            });
-            if (!session) {
-              throw new TRPCError({
-                code: "NOT_FOUND",
-                message: "Session not found in project",
-              });
-            }
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "comments:read",
+      });
 
-            const allTraceCommentCounts = await ctx.prisma.$queryRaw<
-              Array<{ objectId: string; count: bigint }>
-            >`
-            SELECT object_id as "objectId", COUNT(*) as count
-            FROM comments
-            WHERE project_id = ${input.projectId}
-            AND object_type = 'TRACE'
-            GROUP BY object_id
-          `;
+      const clickhouseTraces = ctx.session.user?.v4BetaEnabled
+        ? await getTracesIdentifierForSessionFromEvents(
+            input.projectId,
+            input.sessionId,
+          )
+        : // eslint-disable-next-line @typescript-eslint/no-deprecated
+          await getTracesIdentifierForSession(input.projectId, input.sessionId);
 
-            const traceIds = new Set(
-              session.traces.map((t: { id: string }) => t.id),
-            );
-            return new Map(
-              allTraceCommentCounts
-                .filter((c) => traceIds.has(c.objectId))
-                .map(({ objectId, count }) => [objectId, Number(count)]),
-            );
-          },
-          clickhouseExecution: async () => {
-            const clickhouseTraces = await getTracesIdentifierForSession(
-              input.projectId,
-              input.sessionId,
-            );
+      const allTraceCommentCounts = await ctx.prisma.$queryRaw<
+        Array<{ objectId: string; count: bigint }>
+      >`
+          SELECT object_id as "objectId", COUNT(*) as count
+          FROM comments
+          WHERE project_id = ${input.projectId}
+          AND object_type = 'TRACE'
+          GROUP BY object_id
+        `;
 
-            const allTraceCommentCounts = await ctx.prisma.$queryRaw<
-              Array<{ objectId: string; count: bigint }>
-            >`
-              SELECT object_id as "objectId", COUNT(*) as count
-              FROM comments
-              WHERE project_id = ${input.projectId}
-              AND object_type = 'TRACE'
-              GROUP BY object_id
-            `;
+      const traceIds = new Set(clickhouseTraces.map((t) => t.id));
+      return new Map(
+        allTraceCommentCounts
+          .filter((c) => traceIds.has(c.objectId))
+          .map(({ objectId, count }) => [objectId, Number(count)]),
+      );
+    }),
+  getTraceCommentsBySessionId: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        sessionId: z.string(),
+      }),
+    )
+    .query(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "comments:read",
+      });
 
-            const traceIds = new Set(clickhouseTraces.map((t) => t.id));
-            return new Map(
-              allTraceCommentCounts
-                .filter((c) => traceIds.has(c.objectId))
-                .map(({ objectId, count }) => [objectId, Number(count)]),
-            );
-          },
-        });
-      } catch (e) {
-        console.error(e);
-        throw new TRPCError({
-          code: "INTERNAL_SERVER_ERROR",
-          message: "Unable to get trace comment counts by session id",
-        });
+      const clickhouseTraces = ctx.session.user?.v4BetaEnabled
+        ? await getTracesIdentifierForSessionFromEvents(
+            input.projectId,
+            input.sessionId,
+          )
+        : // eslint-disable-next-line @typescript-eslint/no-deprecated
+          await getTracesIdentifierForSession(input.projectId, input.sessionId);
+
+      const traceIds = clickhouseTraces.map((t) => t.id);
+
+      if (traceIds.length === 0) {
+        return {};
       }
+
+      // Fetch all comments for the traces with user information (ASC order for chronological listing)
+      const enrichedComments = await ctx.prisma.$queryRaw<
+        Array<{
+          id: string;
+          objectId: string;
+          content: string;
+          createdAt: Date;
+          updatedAt: Date;
+          authorUserId: string | null;
+          authorUserImage: string | null;
+          authorUserName: string | null;
+          dataField: string | null;
+          path: string[];
+          rangeStart: number[];
+          rangeEnd: number[];
+        }>
+      >(
+        Prisma.sql`
+          SELECT
+            c.id,
+            c.object_id AS "objectId",
+            c.content,
+            c.created_at AS "createdAt",
+            c.updated_at AS "updatedAt",
+            c.data_field AS "dataField",
+            c.path,
+            c.range_start AS "rangeStart",
+            c.range_end AS "rangeEnd",
+            u.id AS "authorUserId",
+            u.image AS "authorUserImage",
+            u.name AS "authorUserName"
+          FROM comments c
+          LEFT JOIN users u ON u.id = c.author_user_id
+          WHERE
+            c."project_id" = ${input.projectId}
+            AND c."object_type"::text = 'TRACE'
+            AND c."object_id" = ANY(${traceIds}::text[])
+          ORDER BY
+            c.created_at ASC
+        `,
+      );
+
+      // Group comments by trace ID
+      const commentsByTrace: Record<string, typeof enrichedComments> = {};
+      for (const comment of enrichedComments) {
+        if (!commentsByTrace[comment.objectId]) {
+          commentsByTrace[comment.objectId] = [];
+        }
+        commentsByTrace[comment.objectId].push(comment);
+      }
+
+      return commentsByTrace;
     }),
 });

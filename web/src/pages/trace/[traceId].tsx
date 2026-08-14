@@ -1,3 +1,7 @@
+// Redirect helper for /trace/[traceId] URLs
+// Looks up the projectId for a trace and redirects to /project/[projectId]/traces/[traceId]
+// which displays the current trace view
+
 import { ErrorPage } from "@/src/components/error-page";
 import { getTracesByIdsForAnyProject } from "@langfuse/shared/src/server";
 import { type GetServerSideProps } from "next";
@@ -16,10 +20,18 @@ export const getServerSideProps: GetServerSideProps = async (context) => {
 
   const traces = await getTracesByIdsForAnyProject([traceId]);
 
-  if (!traces || traces.length === 0 || traces.length > 1) {
+  if (!traces || traces.length === 0) {
     return {
       props: {
         notFound: true,
+      },
+    };
+  }
+
+  if (traces.length > 1) {
+    return {
+      props: {
+        duplicatesFound: true,
       },
     };
   }
@@ -32,15 +44,37 @@ export const getServerSideProps: GetServerSideProps = async (context) => {
   };
 };
 
-const TraceRedirectPage = ({ notFound }: { notFound?: boolean }) => {
+const TraceRedirectPage = ({
+  notFound,
+  duplicatesFound,
+}: {
+  notFound?: boolean;
+  duplicatesFound?: boolean;
+}) => {
   const router = useRouter();
   if (router.isFallback) {
-    return <div>Loading...</div>;
+    return <div className="p-3">Loading...</div>;
   }
 
   if (notFound) {
     return (
-      <ErrorPage message="Trace not found. Please upgrade the SDK as we changed the URL schema." />
+      <ErrorPage
+        title="Trace not found"
+        message="The trace is either still being processed or has been deleted."
+        additionalButton={{
+          label: "Retry",
+          onClick: () => window.location.reload(),
+        }}
+      />
+    );
+  }
+
+  if (duplicatesFound) {
+    return (
+      <ErrorPage
+        title="Trace not found"
+        message="Please upgrade the SDK as the URL schema has changed."
+      />
     );
   }
 

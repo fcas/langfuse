@@ -1,6 +1,8 @@
+/* eslint-disable @repo/no-style-props */
 import { signIn, useSession } from "next-auth/react";
 import { Button } from "@/src/components/ui/button";
-import { useEffect, useState } from "react";
+import { Input } from "@/src/components/ui/input";
+import { useState } from "react";
 import { z } from "zod";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
 import { env } from "@/src/env.mjs";
@@ -9,22 +11,20 @@ export function RequestResetPasswordEmailButton({
   email,
   className,
   variant = "default",
+  callbackUrl,
 }: {
   email: string;
   className?: string;
   variant?: "default" | "secondary";
+  callbackUrl?: string;
 }) {
   const [isEmailSent, setIsEmailSent] = useState(false);
+  const [code, setCode] = useState("");
   const [isLoading, setIsLoading] = useState(false);
-  const [isValidEmail, setIsValidEmail] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const session = useSession();
   const capture = usePostHogClientCapture();
-
-  useEffect(() => {
-    const isValidEmail = z.string().email().safeParse(email).success;
-    setIsValidEmail(isValidEmail);
-  }, [email]);
+  const isValidEmail = z.email().safeParse(email).success;
 
   const handleResetPassword = async () => {
     if (!isValidEmail) return;
@@ -32,9 +32,12 @@ export function RequestResetPasswordEmailButton({
     setIsLoading(true);
     setErrorMessage(null);
     try {
+      const targetCallbackUrl = callbackUrl
+        ? `${env.NEXT_PUBLIC_BASE_PATH ?? ""}${callbackUrl}`
+        : `${env.NEXT_PUBLIC_BASE_PATH ?? ""}/auth/reset-password`;
       const res = await signIn("email", {
         email: email,
-        callbackUrl: `${env.NEXT_PUBLIC_BASE_PATH ?? ""}/auth/reset-password`,
+        callbackUrl: targetCallbackUrl,
         redirect: false,
       });
       if (res?.error) {
@@ -54,23 +57,71 @@ export function RequestResetPasswordEmailButton({
     }
   };
 
+  const handleVerify = async (_e: React.MouseEvent<HTMLButtonElement>) => {
+    if (!code) return;
+    setIsLoading(true);
+    setErrorMessage(null);
+    try {
+      const formattedEmail = encodeURIComponent(email.toLowerCase().trim());
+      const formattedCode = encodeURIComponent(code.trim());
+      const targetCb = callbackUrl
+        ? `${env.NEXT_PUBLIC_BASE_PATH ?? ""}${callbackUrl}`
+        : `${env.NEXT_PUBLIC_BASE_PATH ?? ""}/auth/reset-password`;
+      const callback = encodeURIComponent(targetCb);
+      const url = `${env.NEXT_PUBLIC_BASE_PATH ?? ""}/api/auth/callback/email?email=${formattedEmail}&token=${formattedCode}&callbackUrl=${callback}`;
+      // Existing hard navigation is accepted during the Next.js 16.3 migration.
+      // eslint-disable-next-line @next/next/no-location-assign-relative-destination
+      window.location.href = url;
+    } catch (error) {
+      console.error("Error verifying code:", error);
+      setErrorMessage("An unexpected error occurred. Please try again.");
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
   return (
     <>
-      <Button
-        onClick={handleResetPassword}
-        className={className}
-        loading={isLoading}
-        disabled={isEmailSent || !isValidEmail}
-        variant={variant}
-      >
-        {isEmailSent
-          ? "Email sent. Please check your inbox"
-          : session.status === "authenticated"
+      {isEmailSent ? (
+        <div>
+          <label htmlFor="otp-code" className="mb-2 block text-sm font-bold">
+            Check your inbox for the code
+          </label>
+          <Input
+            id="otp-code"
+            type="number"
+            minLength={6}
+            maxLength={6}
+            value={code}
+            onChange={(e) => setCode(e.target.value.trim())}
+            placeholder="One time passcode"
+            className="mb-8 w-full"
+          />
+          <Button
+            onClick={handleVerify}
+            className={className}
+            loading={isLoading}
+            disabled={!code || code.length !== 6}
+            variant={variant}
+          >
+            Verify code
+          </Button>
+        </div>
+      ) : (
+        <Button
+          onClick={handleResetPassword}
+          className={className}
+          loading={isLoading}
+          disabled={!isValidEmail}
+          variant={variant}
+        >
+          {session.status === "authenticated"
             ? "Verify email to change password"
             : "Request password reset"}
-      </Button>
+        </Button>
+      )}
       {errorMessage && (
-        <div className="mt-3 text-center text-sm text-destructive">
+        <div className="text-destructive mt-3 text-center text-sm">
           {errorMessage}
         </div>
       )}

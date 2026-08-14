@@ -1,4 +1,10 @@
-import { Building2, LifeBuoy, LockIcon, Settings, Users } from "lucide-react";
+import {
+  BookOpen,
+  LockIcon,
+  MessageSquareText,
+  Settings,
+  Users,
+} from "lucide-react";
 import {
   Card,
   CardContent,
@@ -7,16 +13,15 @@ import {
   CardHeader,
   CardTitle,
 } from "@/src/components/ui/card";
+import { Separator } from "@/src/components/ui/separator";
 import Header from "@/src/components/layouts/header";
 import { Button } from "@/src/components/ui/button";
 import { PlusIcon } from "lucide-react";
 import Link from "next/link";
 import { StringParam, useQueryParams } from "use-query-params";
 import { Input } from "@/src/components/ui/input";
-import { Alert, AlertTitle, AlertDescription } from "@/src/components/ui/alert";
 import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { env } from "@/src/env.mjs";
-import { Divider } from "@tremor/react";
 import { Fragment } from "react";
 import { useRouter } from "next/router";
 import { useSession } from "next-auth/react";
@@ -25,114 +30,104 @@ import {
   createProjectRoute,
 } from "@/src/features/setup/setupRoutes";
 import { isCloudPlan, planLabels } from "@langfuse/shared";
-import { ScrollScreenPage } from "@/src/components/layouts/scroll-screen-page";
+import ContainerPage from "@/src/components/layouts/container-page";
+import { type Session } from "next-auth";
+import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
+import { AgentToolsBanner } from "@/src/features/developer-tools/components/AgentToolsBanner";
+import { V4MigrationBanner } from "@/src/features/v4-migration/V4MigrationBanner";
+import { V4MigrationProjectChip } from "@/src/features/v4-migration/V4MigrationProjectChip";
+import { api } from "@/src/utils/api";
+import { formatCompactRelativeTime } from "@/src/utils/dates";
+import { useV4UpgradeUiEnabled } from "@/src/features/v4-migration/useV4UpgradeUiEnabled";
+import { useAccountV4MigrationData } from "@/src/features/v4-migration/hooks/useV4MigrationData";
 
-const SingleOrganizationProjectOverview = ({
-  orgId,
+const OrganizationProjectTiles = ({
+  org,
   search,
-  level = "h2",
 }: {
-  orgId: string;
+  org: NonNullable<Session["user"]>["organizations"][number];
   search?: string;
-  level?: "h2" | "h3";
 }) => {
-  const createProjectAccess = useHasOrganizationAccess({
-    organizationId: orgId,
-    scope: "projects:create",
+  const v4UpgradeUiEnabled = useV4UpgradeUiEnabled();
+  const lastTraceQuery = api.organizations.lastTraceByProject.useQuery(
+    { orgId: org.id },
+    { enabled: v4UpgradeUiEnabled },
+  );
+  const migrationStatusByProjectId = useAccountV4MigrationData({
+    organizations: [
+      {
+        id: org.id,
+        name: org.name,
+        projects: org.projects
+          .filter((project) => !project.deletedAt)
+          .map((project) => ({ id: project.id, name: project.name })),
+      },
+    ],
+    enabled: v4UpgradeUiEnabled,
   });
-  const membersViewAccess = useHasOrganizationAccess({
-    organizationId: orgId,
-    scope: "organizationMembers:read",
-  });
-  const session = useSession();
-  const org = session.data?.user?.organizations.find((o) => o.id === orgId);
-
-  if (!org) {
-    return null;
-  }
-
-  const isDemoOrg =
-    env.NEXT_PUBLIC_DEMO_ORG_ID === orgId &&
-    org.projects.some((p) => p.id === env.NEXT_PUBLIC_DEMO_PROJECT_ID);
-
-  if (isDemoOrg) {
-    return (
-      <div key={orgId}>
-        {level === "h2" && <Header title="Demo Organization" />}
-        <Card>
-          <CardHeader>
-            <CardTitle>Try Langfuse Demo</CardTitle>
-          </CardHeader>
-          <CardContent>
-            We have built a Q&A chatbot that answers questions based on the
-            Langfuse Docs. Interact with it to see traces in Langfuse.
-          </CardContent>
-          <CardFooter>
-            <Button asChild variant="secondary">
-              <Link href={`/project/${env.NEXT_PUBLIC_DEMO_PROJECT_ID}`}>
-                View Demo Project
-              </Link>
-            </Button>
-          </CardFooter>
-        </Card>
-      </div>
-    );
-  }
-
   return (
-    <div key={orgId} className="mb-10">
-      <Header
-        title={org.name}
-        level={level}
-        status={orgId === env.NEXT_PUBLIC_DEMO_ORG_ID ? "Demo Org" : undefined}
-        label={
-          isCloudPlan(org.plan) && level === "h3"
-            ? {
-                text: planLabels[org.plan],
-                href: `/organization/${org.id}/settings/billing`,
-              }
-            : undefined
-        }
-        actionButtons={
-          <>
-            <Button asChild variant="ghost">
-              <Link href={`/organization/${orgId}/settings`}>
-                <Settings size={14} />
-              </Link>
-            </Button>
-            {membersViewAccess && (
-              <Button asChild variant="ghost">
-                <Link href={`/organization/${orgId}/settings/members`}>
-                  <Users size={14} />
-                </Link>
-              </Button>
-            )}
-            {createProjectAccess ? (
-              <Button asChild variant="secondary">
-                <Link href={createProjectRoute(orgId)}>
-                  <PlusIcon className="mr-2 h-4 w-4" aria-hidden="true" />
-                  New project
-                </Link>
-              </Button>
-            ) : (
-              <Button variant="secondary" disabled>
-                <LockIcon className="mr-2 h-4 w-4" aria-hidden="true" />
-                New project
-              </Button>
-            )}
-          </>
-        }
-      />
-      <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
-        {org.projects
-          .filter(
-            (p) =>
-              !search || p.name.toLowerCase().includes(search.toLowerCase()),
-          )
-          .map((project) => (
+    <div className="grid grid-cols-1 gap-5 sm:grid-cols-2 lg:grid-cols-3">
+      {org.projects
+        .filter(
+          (p) => !search || p.name.toLowerCase().includes(search.toLowerCase()),
+        )
+        .map((project) =>
+          v4UpgradeUiEnabled ? (
+            <Card
+              key={project.id}
+              className="group hover:bg-muted/50 relative transition-colors"
+            >
+              {!project.deletedAt && (
+                <Link
+                  href={`/project/${project.id}`}
+                  className="absolute inset-0"
+                  aria-label={`Go to project ${project.name}`}
+                />
+              )}
+              <CardHeader>
+                <div className="flex items-start justify-between gap-2">
+                  <CardTitle
+                    className="truncate text-base"
+                    title={project.name}
+                  >
+                    {project.name}
+                  </CardTitle>
+                  {!project.deletedAt && (
+                    <V4MigrationProjectChip
+                      project={{ id: project.id, name: project.name }}
+                      status={migrationStatusByProjectId.get(project.id)}
+                    />
+                  )}
+                </div>
+              </CardHeader>
+              {!project.deletedAt && (
+                <CardContent className="min-h-7 pb-3">
+                  <p className="text-muted-foreground text-xs">
+                    {lastTraceQuery.isSuccess
+                      ? (() => {
+                          const lastTraceAt = lastTraceQuery.data?.find(
+                            (t) => t.projectId === project.id,
+                          )?.lastTraceAt;
+                          return lastTraceAt
+                            ? `Last trace ${formatCompactRelativeTime(new Date(lastTraceAt))}`
+                            : "No traces in the last 30d";
+                        })()
+                      : null}
+                  </p>
+                </CardContent>
+              )}
+              {project.deletedAt && (
+                <CardContent>
+                  <CardDescription>Project is being deleted</CardDescription>
+                </CardContent>
+              )}
+            </Card>
+          ) : (
             <Card key={project.id}>
               <CardHeader>
-                <CardTitle className="text-base">{project.name}</CardTitle>
+                <CardTitle className="truncate text-base" title={project.name}>
+                  {project.name}
+                </CardTitle>
               </CardHeader>
               {!project.deletedAt ? (
                 <CardFooter className="gap-2">
@@ -151,8 +146,181 @@ const SingleOrganizationProjectOverview = ({
                 </CardContent>
               )}
             </Card>
-          ))}
+          ),
+        )}
+    </div>
+  );
+};
+
+const DemoOrganizationTile = () => {
+  const capture = usePostHogClientCapture();
+
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle>Try Langfuse Demo</CardTitle>
+      </CardHeader>
+      <CardContent>
+        We have built a Q&A chatbot that answers questions based on the Langfuse
+        Docs. Interact with it to see traces in Langfuse.
+      </CardContent>
+      <CardFooter>
+        <Button asChild variant="secondary">
+          <Link
+            href={`/project/${env.NEXT_PUBLIC_DEMO_PROJECT_ID}/traces`}
+            onClick={() =>
+              capture("organizations:demo_project_button_click", {
+                location: "project_overview_demo_tile",
+              })
+            }
+          >
+            View Demo Project
+          </Link>
+        </Button>
+      </CardFooter>
+    </Card>
+  );
+};
+
+const OrganizationActionButtons = ({
+  orgId,
+  primaryButtonVariant = "default",
+}: {
+  orgId: string;
+  primaryButtonVariant?: "default" | "secondary";
+}) => {
+  const membersViewAccess = useHasOrganizationAccess({
+    organizationId: orgId,
+    scope: "organizationMembers:read",
+  });
+  const createProjectAccess = useHasOrganizationAccess({
+    organizationId: orgId,
+    scope: "projects:create",
+  });
+
+  return (
+    <>
+      <Button asChild variant="ghost">
+        <Link href={`/organization/${orgId}/settings`}>
+          <Settings size={14} />
+        </Link>
+      </Button>
+      {membersViewAccess && (
+        <Button asChild variant="ghost">
+          <Link href={`/organization/${orgId}/settings/members`}>
+            <Users size={14} />
+          </Link>
+        </Button>
+      )}
+      {createProjectAccess ? (
+        <Button asChild variant={primaryButtonVariant}>
+          <Link href={createProjectRoute(orgId)}>
+            <PlusIcon className="mr-2 h-4 w-4" aria-hidden="true" />
+            New project
+          </Link>
+        </Button>
+      ) : (
+        <Button disabled variant={primaryButtonVariant}>
+          <LockIcon className="mr-2 h-4 w-4" aria-hidden="true" />
+          New project
+        </Button>
+      )}
+    </>
+  );
+};
+
+const SingleOrganizationPage = ({
+  orgId,
+  search,
+}: {
+  orgId: string;
+  search?: string;
+}) => {
+  const session = useSession();
+  const org = session.data?.user?.organizations.find((o) => o.id === orgId);
+
+  if (!org) {
+    return null;
+  }
+
+  const isDemoOrg =
+    env.NEXT_PUBLIC_DEMO_ORG_ID === orgId &&
+    org.projects.some((p) => p.id === env.NEXT_PUBLIC_DEMO_PROJECT_ID);
+
+  if (isDemoOrg) {
+    return (
+      <ContainerPage
+        headerProps={{
+          title: "Demo Organization",
+        }}
+      >
+        <DemoOrganizationTile />
+      </ContainerPage>
+    );
+  }
+
+  return (
+    <ContainerPage
+      headerProps={{
+        title: org?.name ?? "Organization",
+        actionButtonsRight: <OrganizationActionButtons orgId={orgId} />,
+      }}
+    >
+      <OrganizationProjectTiles org={org} search={search} />
+    </ContainerPage>
+  );
+};
+
+const SingleOrganizationProjectOverviewTile = ({
+  orgId,
+  search,
+}: {
+  orgId: string;
+  search?: string;
+}) => {
+  const session = useSession();
+  const org = session.data?.user?.organizations.find((o) => o.id === orgId);
+
+  if (!org) {
+    return null;
+  }
+
+  const isDemoOrg =
+    env.NEXT_PUBLIC_DEMO_ORG_ID === orgId &&
+    org.projects.some((p) => p.id === env.NEXT_PUBLIC_DEMO_PROJECT_ID);
+
+  if (isDemoOrg) {
+    return (
+      <div key={orgId}>
+        <DemoOrganizationTile />
       </div>
+    );
+  }
+
+  return (
+    <div key={orgId}>
+      <Header
+        title={org.name}
+        className="truncate"
+        labelBadge={
+          orgId === env.NEXT_PUBLIC_DEMO_ORG_ID ? "Demo Org" : undefined
+        }
+        label={
+          isCloudPlan(org.plan)
+            ? {
+                text: planLabels[org.plan],
+                href: `/organization/${org.id}/settings/billing`,
+              }
+            : undefined
+        }
+        actionButtons={
+          <OrganizationActionButtons
+            orgId={orgId}
+            primaryButtonVariant="secondary"
+          />
+        }
+      />
+      <OrganizationProjectTiles org={org} search={search} />
     </div>
   );
 };
@@ -161,6 +329,7 @@ export const OrganizationProjectOverview = () => {
   const router = useRouter();
   const queryOrgId = router.query.organizationId;
   const session = useSession();
+  const v4UpgradeUiEnabled = useV4UpgradeUiEnabled();
   const canCreateOrg = session.data?.user?.canCreateOrganizations;
   const organizations = session.data?.user?.organizations;
   const [{ search }, setQueryParams] = useQueryParams({ search: StringParam });
@@ -173,83 +342,86 @@ export const OrganizationProjectOverview = () => {
     organizations.filter((org) => org.id !== env.NEXT_PUBLIC_DEMO_ORG_ID)
       .length === 0 && !queryOrgId;
 
+  if (queryOrgId) {
+    const org = organizations.find((org) => org.id === queryOrgId);
+
+    if (!org) {
+      return null;
+    }
+
+    return (
+      <SingleOrganizationPage orgId={org.id} search={search ?? undefined} />
+    );
+  }
+
   return (
-    <ScrollScreenPage>
-      {!queryOrgId && (
-        <>
-          <Header
-            title="Home"
-            actionButtons={
-              <>
-                <Input
-                  className="w-36 lg:w-56"
-                  placeholder="Search projects"
-                  onChange={(e) => setQueryParams({ search: e.target.value })}
-                />
-                {canCreateOrg && (
-                  <Button data-testid="create-organization-btn" asChild>
-                    <Link href={createOrganizationRoute}>
-                      <PlusIcon className="mr-1.5 h-4 w-4" aria-hidden="true" />
-                      New Organization
-                    </Link>
-                  </Button>
-                )}
-              </>
-            }
-          />
-          {!showOnboarding && <IntroducingOrganizations />}
-        </>
-      )}
+    <ContainerPage
+      headerProps={{
+        title: "Organizations",
+        help: {
+          description:
+            "Organizations help you manage access to projects. Each organization can have multiple projects and team members with different roles.",
+          href: "https://langfuse.com/docs/rbac",
+        },
+        breadcrumb: [
+          {
+            name: "Organizations",
+            href: "/",
+          },
+        ],
+        actionButtonsRight: (
+          <>
+            <Input
+              className="mr-1 w-36 lg:w-56"
+              placeholder="Search projects"
+              onChange={(e) => setQueryParams({ search: e.target.value })}
+            />
+            {canCreateOrg && (
+              <Button data-testid="create-organization-btn" asChild>
+                <Link href={createOrganizationRoute}>
+                  <PlusIcon className="mr-1.5 h-4 w-4" aria-hidden="true" />
+                  New Organization
+                </Link>
+              </Button>
+            )}
+          </>
+        ),
+      }}
+    >
+      {v4UpgradeUiEnabled ? <V4MigrationBanner /> : <AgentToolsBanner />}
       {showOnboarding && <Onboarding />}
       {organizations
-        .filter((org) => queryOrgId === undefined || org.id === queryOrgId)
-        .sort((a, b) => {
-          // sort demo org to the bottom
-          const isDemoA = env.NEXT_PUBLIC_DEMO_ORG_ID === a.id;
-          const isDemoB = env.NEXT_PUBLIC_DEMO_ORG_ID === b.id;
+        .map((org) => {
+          const isDemo = env.NEXT_PUBLIC_DEMO_ORG_ID === org.id;
+          return [org, isDemo] as const;
+        })
+        .sort(([, isDemoA], [, isDemoB]) => {
           if (isDemoA) return 1;
           if (isDemoB) return -1;
           return 0;
         })
-        .map((org) => (
-          <Fragment key={org.id}>
-            {!queryOrgId && org.id === env.NEXT_PUBLIC_DEMO_ORG_ID && (
-              <Divider />
-            )}
-            <SingleOrganizationProjectOverview
-              orgId={org.id}
-              search={search ?? undefined}
-              level={queryOrgId ? "h2" : "h3"}
-            />
-          </Fragment>
-        ))}
-    </ScrollScreenPage>
+        .map(([org, isDemo], index) => {
+          return (
+            <Fragment key={org.id}>
+              {!queryOrgId && isDemo && <Separator className="my-8" />}
+              <div key={org.id} className={index > 0 && !isDemo ? "mt-8" : ""}>
+                <SingleOrganizationProjectOverviewTile
+                  orgId={org.id}
+                  search={search ?? undefined}
+                />
+              </div>
+            </Fragment>
+          );
+        })}
+    </ContainerPage>
   );
 };
-
-const IntroducingOrganizations = () => (
-  <Alert className="mb-10 mt-5">
-    <Building2 className="h-4 w-4" />
-    <AlertTitle>Introducing Organizations</AlertTitle>
-    <AlertDescription>
-      Organizations are a way to group projects and manage access to them. See{" "}
-      <Link
-        href="https://langfuse.com/changelog/2024-08-13-organizations"
-        className="underline"
-        target="_blank"
-      >
-        changelog
-      </Link>{" "}
-      to learn more.
-    </AlertDescription>
-  </Alert>
-);
 
 const Onboarding = () => {
   const session = useSession();
   const canCreateOrgs = session.data?.user?.canCreateOrganizations;
   return (
-    <Card>
+    <Card className="mt-5">
       <CardHeader>
         <CardTitle data-testid="create-new-project-title">
           Get Started
@@ -272,9 +444,15 @@ const Onboarding = () => {
           </Button>
         )}
         <Button variant="secondary" asChild>
-          <Link href="/support">
-            <LifeBuoy className="mr-2 h-4 w-4" aria-hidden="true" />
-            Support
+          <Link href="https://langfuse.com/docs" target="_blank">
+            <BookOpen className="mr-2 h-4 w-4" aria-hidden="true" />
+            Docs
+          </Link>
+        </Button>
+        <Button variant="secondary" asChild>
+          <Link href="https://langfuse.com/docs/ask-ai" target="_blank">
+            <MessageSquareText className="mr-2 h-4 w-4" aria-hidden="true" />
+            Ask AI
           </Link>
         </Button>
       </CardFooter>

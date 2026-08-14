@@ -1,65 +1,171 @@
-const { resolve } = require("node:path");
+import { fixupPluginRules } from "@eslint/compat";
+import nextPlugin from "@next/eslint-plugin-next";
+import importPlugin from "eslint-plugin-import";
+import jsxA11yPlugin from "eslint-plugin-jsx-a11y";
+import reactPlugin from "eslint-plugin-react";
+import reactHooksPlugin from "eslint-plugin-react-hooks";
+import globals from "globals";
+import tseslint from "typescript-eslint";
+import sharedConfig from "./shared.js";
 
-const project = resolve(process.cwd(), "tsconfig.json");
+export default [
+  // Global ignores - include config files
+  {
+    name: "langfuse/ignores",
+    ignores: ["**/.next/", "**/.next-check/"],
+  },
 
-/*
- * This is a custom ESLint configuration for use with
- * Next.js apps.
- *
- * This config extends the Vercel Engineering Style Guide.
- * For more information, see https://github.com/vercel/style-guide
- *
- */
+  // Use the plugins directly because this repo owns its parser and import resolver setup.
+  {
+    name: "langfuse/next/base",
+    files: ["**/*.{js,jsx,mjs,ts,tsx,mts,cts}"],
+    plugins: {
+      react: fixupPluginRules(reactPlugin),
+      "react-hooks": fixupPluginRules(reactHooksPlugin),
+      import: fixupPluginRules(importPlugin),
+      "jsx-a11y": fixupPluginRules(jsxA11yPlugin),
+      "@next/next": nextPlugin,
+    },
+    languageOptions: {
+      parserOptions: {
+        ecmaFeatures: {
+          jsx: true,
+        },
+      },
+      globals: {
+        ...globals.browser,
+        ...globals.node,
+      },
+    },
+    settings: {
+      react: {
+        version: "detect",
+      },
+      "import/parsers": {
+        "@typescript-eslint/parser": [".ts", ".mts", ".cts", ".tsx", ".d.ts"],
+      },
+      "import/resolver": {
+        node: {
+          extensions: [".js", ".jsx", ".ts", ".tsx"],
+        },
+        typescript: {
+          alwaysTryTypes: true,
+        },
+      },
+    },
+    rules: {
+      ...reactPlugin.configs.recommended.rules,
+      ...reactHooksPlugin.configs.recommended.rules,
+      ...nextPlugin.configs["core-web-vitals"].rules,
+      "import/no-anonymous-default-export": "warn",
+      "react/no-unknown-property": "off",
+      "react/react-in-jsx-scope": "off",
+      "react/prop-types": "off",
+      "jsx-a11y/alt-text": ["warn", { elements: ["img"], img: ["Image"] }],
+      "jsx-a11y/aria-props": "warn",
+      "jsx-a11y/aria-proptypes": "warn",
+      "jsx-a11y/aria-unsupported-elements": "warn",
+      "jsx-a11y/role-has-required-aria-props": "warn",
+      "jsx-a11y/role-supports-aria-props": "warn",
+      "react/jsx-no-target-blank": "off",
+    },
+  },
 
-module.exports = {
-  parser: "@typescript-eslint/parser", // Set the parser to @typescript-eslint/parser
-  extends: [
-    "plugin:@typescript-eslint/recommended",
-    "plugin:@typescript-eslint/strict-type-checked",
-    "eslint-config-turbo",
-  ],
-  rules: {
-    "@typescript-eslint/no-non-null-assertion": "off",
-    "@typescript-eslint/no-confusing-void-expression": "off",
-  },
-  parser: "@typescript-eslint/parser",
-
-  parserOptions: {
-    project,
-  },
-  globals: {
-    React: true,
-    JSX: true,
-  },
-  plugins: ["@typescript-eslint"],
-  extends: ["next/core-web-vitals"],
-  env: {
-    es6: true,
-    jest: true,
-  },
-  settings: {
-    "import/resolver": {
-      typescript: {
-        project,
+  {
+    name: "langfuse/next/typescript-parser",
+    files: ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
+    plugins: {
+      "@typescript-eslint": tseslint.plugin,
+    },
+    languageOptions: {
+      parser: tseslint.parser,
+      parserOptions: {
+        sourceType: "module",
       },
     },
   },
-  ignorePatterns: ["node_modules/", "dist/"],
-  // add rules configurations here
-  rules: {
-    "@typescript-eslint/consistent-type-imports": [
-      "warn",
-      {
-        prefer: "type-imports",
-        fixStyle: "inline-type-imports",
-      },
-    ],
-    "@typescript-eslint/no-unused-vars": ["warn", { argsIgnorePattern: "^_" }],
-    "react/jsx-key": [
-      "error",
-      {
-        warnOnDuplicates: true,
-      },
-    ],
+
+  {
+    name: "langfuse/next/ignores",
+    ignores: [".next/**", "out/**", "build/**", "next-env.d.ts"],
   },
-};
+
+  // Keep the pre-React-Compiler hooks baseline used by this repo.
+  {
+    name: "langfuse/next/react-hooks-overrides",
+    rules: {
+      "react-hooks/component-hook-factories": "off",
+      "react-hooks/config": "off",
+      "react-hooks/error-boundaries": "off",
+      "react-hooks/gating": "off",
+      "react-hooks/globals": "off",
+      "react-hooks/immutability": "off",
+      "react-hooks/incompatible-library": "off",
+      "react-hooks/preserve-manual-memoization": "off",
+      "react-hooks/purity": "off",
+      "react-hooks/refs": "off",
+      "react-hooks/set-state-in-effect": "off",
+      "react-hooks/set-state-in-render": "off",
+      "react-hooks/static-components": "off",
+      "react-hooks/unsupported-syntax": "off",
+      "react-hooks/use-memo": "off",
+    },
+  },
+
+  ...sharedConfig,
+
+  // Disable noisy turbo env var rule - project has many env vars not in turbo.json
+  {
+    name: "langfuse/next/turbo-overrides",
+    rules: {
+      "turbo/no-undeclared-env-vars": "off",
+    },
+  },
+
+  // Layer repo-specific TS rules on top of Next's built-in flat TS config.
+  // Next already provides the parser and @typescript-eslint plugin here.
+  {
+    name: "langfuse/next/typescript",
+    files: ["**/*.ts", "**/*.tsx", "**/*.mts", "**/*.cts"],
+    ignores: ["**/vitest.config.mts"],
+    languageOptions: {
+      parserOptions: {
+        projectService: true,
+      },
+      globals: {
+        React: "readonly",
+        JSX: "readonly",
+      },
+    },
+    settings: {
+      "import/resolver": {
+        typescript: {
+          project: "./tsconfig.json",
+        },
+      },
+    },
+    rules: {
+      "@repo/no-abstracted-overlay-trigger": "warn",
+      "@repo/no-tailwind-overflow-scroll": "warn",
+      // Custom rules from old config
+      "@typescript-eslint/consistent-type-imports": [
+        "warn",
+        {
+          prefer: "type-imports",
+          fixStyle: "inline-type-imports",
+        },
+      ],
+      "@typescript-eslint/no-deprecated": "warn",
+      "react/jsx-curly-brace-presence": [
+        "warn",
+        {
+          props: "never",
+          children: "ignore",
+          propElementValues: "always",
+        },
+      ],
+      "react/jsx-key": ["error", { warnOnDuplicates: true }],
+      "react/no-unused-prop-types": "warn",
+    },
+  },
+];

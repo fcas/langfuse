@@ -1,77 +1,131 @@
-import { Check, ChevronsUpDown } from "lucide-react";
-import { useEffect, useState } from "react";
-
-import { useClickhouse } from "@/src/components/layouts/ClickhouseAdminToggle";
+/* eslint-disable @repo/no-style-props */
 import { NoDataOrLoading } from "@/src/components/NoDataOrLoading";
-import { Button } from "@/src/components/ui/button";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-  CommandSeparator,
-} from "@/src/components/ui/command";
-import {
-  Popover,
-  PopoverContent,
-  PopoverTrigger,
-} from "@/src/components/ui/popover";
-import { env } from "@/src/env.mjs";
-import { BaseTimeSeriesChart } from "@/src/features/dashboard/components/BaseTimeSeriesChart";
 import { DashboardCard } from "@/src/features/dashboard/components/cards/DashboardCard";
 import {
   extractTimeSeriesData,
   fillMissingValuesAndTransform,
-  getAllModels,
   isEmptyTimeSeries,
 } from "@/src/features/dashboard/components/hooks";
 import { TabComponent } from "@/src/features/dashboard/components/TabsComponent";
 import { TotalMetric } from "@/src/features/dashboard/components/TotalMetric";
-import { totalCostDashboardFormatted } from "@/src/features/dashboard/lib/dashboard-utils";
+import { costFormatter } from "@/src/utils/numbers";
 import { api } from "@/src/utils/api";
 import {
   type DashboardDateRangeAggregationOption,
   dashboardDateRangeAggregationSettings,
 } from "@/src/utils/date-range-utils";
 import { compactNumberFormatter } from "@/src/utils/numbers";
-import { cn } from "@/src/utils/tailwind";
-import { type FilterState } from "@langfuse/shared";
+import { type FilterState, getGenerationLikeTypes } from "@langfuse/shared";
+import {
+  ModelSelectorPopover,
+  useModelSelection,
+} from "@/src/features/dashboard/components/ModelSelector";
+import { type QueryType, type ViewVersion } from "@langfuse/shared/query";
+import { mapLegacyUiTableFilterToView } from "@/src/features/dashboard/lib/dashboardUiTableToViewMapping";
+import { type DatabaseRow } from "@/src/server/api/services/sqlInterface";
+import { DashboardLineTimeSeriesChart } from "@/src/features/dashboard/components/DashboardLineTimeSeriesChart";
+import { useScheduledDashboardExecuteQuery } from "@/src/hooks/useDashboardQueryScheduler";
+import { useMemo } from "react";
 
 export const ModelUsageChart = ({
   className,
   projectId,
   globalFilterState,
   agg,
+  fromTimestamp,
+  toTimestamp,
+  userAndEnvFilterState,
+  isLoading = false,
+  metricsVersion,
+  schedulerId,
+  syncId,
 }: {
   className?: string;
   projectId: string;
   globalFilterState: FilterState;
   agg: DashboardDateRangeAggregationOption;
+  fromTimestamp: Date;
+  toTimestamp: Date;
+  userAndEnvFilterState: FilterState;
+  isLoading?: boolean;
+  metricsVersion?: ViewVersion;
+  schedulerId?: string;
+  syncId?: string;
 }) => {
-  const clickhouse = useClickhouse();
-  const allModels = getAllModels(projectId, globalFilterState, clickhouse);
+  const {
+    allModels,
+    selectedModels,
+    setSelectedModels,
+    isAllSelected,
+    buttonText,
+    handleSelectAll,
+  } = useModelSelection(
+    projectId,
+    userAndEnvFilterState,
+    fromTimestamp,
+    toTimestamp,
+    metricsVersion,
+    {
+      enabled: !isLoading,
+      queryId: `${schedulerId ?? "home:model-usage"}:all-models`,
+    },
+  );
+  const hasModelSelection = selectedModels.length > 0 && allModels.length > 0;
+  const isModelUsageEnabled = !isLoading && hasModelSelection;
 
-  const [selectedModels, setSelectedModels] = useState<string[]>([]);
-  const [open, setOpen] = useState(false);
-  const [firstAllModelUpdate, setFirstAllModelUpdate] = useState(true);
-
-  const isAllSelected = selectedModels.length === allModels.length;
-  const buttonText = isAllSelected
-    ? "All models"
-    : `${selectedModels.length} selected`;
-
-  const handleSelectAll = () => {
-    setSelectedModels(isAllSelected ? [] : [...allModels]);
+  const modelUsageQuery: QueryType = {
+    view: "observations",
+    dimensions: [{ field: "providedModelName" }],
+    metrics: [
+      { measure: "totalCost", aggregation: "sum" },
+      { measure: "totalTokens", aggregation: "sum" },
+    ],
+    filters: [
+      ...mapLegacyUiTableFilterToView("observations", userAndEnvFilterState),
+      {
+        column: "type",
+        operator: "any of",
+        value: getGenerationLikeTypes(),
+        type: "stringOptions",
+      },
+      {
+        column: "providedModelName",
+        operator: "any of",
+        value: selectedModels,
+        type: "stringOptions",
+      },
+    ],
+    timeDimension: {
+      granularity:
+        dashboardDateRangeAggregationSettings[agg].dateTrunc ?? "day",
+    },
+    fromTimestamp: fromTimestamp.toISOString(),
+    toTimestamp: toTimestamp.toISOString(),
+    orderBy: null,
   };
 
-  const queryResult = api.dashboard.chart.useQuery(
+  const queryResult = useScheduledDashboardExecuteQuery(
     {
       projectId,
-      from: env.NEXT_PUBLIC_LANGFUSE_CLOUD_REGION // Langfuse Cloud has already completed the cost backfill job, thus cost can be pulled directly from obs. table
-        ? "traces_observations"
-        : "traces_observationsview",
+      query: modelUsageQuery,
+      version: metricsVersion,
+    },
+    {
+      enabled: isModelUsageEnabled,
+      trpc: {
+        context: {
+          skipBatch: true,
+        },
+      },
+      queryId: `${schedulerId ?? "home:model-usage"}:timeseries`,
+      priority: 1001,
+    },
+  );
+
+  const queryCostByType = api.dashboard.chart.useQuery(
+    {
+      projectId,
+      from: "traces_observations",
       select: [
         { column: "totalTokens", agg: "SUM" },
         { column: "calculatedTotalCost", agg: "SUM" },
@@ -79,23 +133,25 @@ export const ModelUsageChart = ({
       ],
       filter: [
         ...globalFilterState,
-        { type: "string", column: "type", operator: "=", value: "GENERATION" },
-        ...(!isAllSelected
-          ? [
-              {
-                type: "stringOptions",
-                column: "model",
-                operator: "any of",
-                value: selectedModels,
-              } as const,
-            ]
-          : []),
+        {
+          type: "stringOptions",
+          column: "type",
+          operator: "any of",
+          value: getGenerationLikeTypes(),
+        },
+        {
+          type: "stringOptions",
+          column: "model",
+          operator: "any of",
+          value: selectedModels,
+        } as const,
       ],
       groupBy: [
         {
           type: "datetime",
           column: "startTime",
-          temporalUnit: dashboardDateRangeAggregationSettings[agg].date_trunc,
+          temporalUnit:
+            dashboardDateRangeAggregationSettings[agg].dateTrunc ?? "day",
         },
         {
           type: "string",
@@ -105,11 +161,11 @@ export const ModelUsageChart = ({
       orderBy: [
         { column: "calculatedTotalCost", direction: "DESC", agg: "SUM" },
       ],
-      queryClickhouse: clickhouse,
-      queryName: "observations-usage-timeseries",
+      queryName: "observations-cost-by-type-timeseries",
+      version: metricsVersion,
     },
     {
-      enabled: selectedModels.length > 0,
+      enabled: isModelUsageEnabled,
       trpc: {
         context: {
           skipBatch: true,
@@ -118,149 +174,181 @@ export const ModelUsageChart = ({
     },
   );
 
-  useEffect(() => {
-    if (firstAllModelUpdate && allModels.length > 0) {
-      setSelectedModels(allModels);
-      setFirstAllModelUpdate(false);
-    }
-  }, [allModels, firstAllModelUpdate]);
-
-  const usageTypeMap = new Map<
-    string,
+  const queryUsageByType = api.dashboard.chart.useQuery(
     {
-      units: number;
-      cost: number;
-      usageType: string;
-      model: string;
-    }[]
-  >();
-
-  queryResult.data?.forEach((row) => {
-    for (const [key, value] of Object.entries(row.units ?? {})) {
-      usageTypeMap.set(key, [
-        ...(usageTypeMap.get(key) ?? []),
+      projectId,
+      from: "traces_observations",
+      select: [
+        { column: "totalTokens", agg: "SUM" },
+        { column: "calculatedTotalCost", agg: "SUM" },
+        { column: "model" },
+      ],
+      filter: [
+        ...globalFilterState,
         {
-          ...row,
-          units: value,
-          cost: Number(row.cost?.[key as keyof typeof row.cost]),
-          usageType: key,
-          model: row.model as string,
+          type: "stringOptions",
+          column: "type",
+          operator: "any of",
+          value: getGenerationLikeTypes(),
         },
-      ]);
-    }
-  });
+        {
+          type: "stringOptions",
+          column: "model",
+          operator: "any of",
+          value: selectedModels,
+        } as const,
+      ],
+      groupBy: [
+        {
+          type: "datetime",
+          column: "startTime",
+          temporalUnit:
+            dashboardDateRangeAggregationSettings[agg].dateTrunc ?? "day",
+        },
+        {
+          type: "string",
+          column: "model",
+        },
+      ],
+      orderBy: [{ column: "totalTokens", direction: "DESC", agg: "SUM" }],
+      queryName: "observations-usage-by-type-timeseries",
+      version: metricsVersion,
+    },
+    {
+      enabled: isModelUsageEnabled,
+      trpc: {
+        context: {
+          skipBatch: true,
+        },
+      },
+    },
+  );
 
-  const usageData = Array.from(usageTypeMap.values()).flat();
-  const currentModels = [
-    ...new Set(usageData.map((row) => row.model).filter(Boolean)),
-  ];
+  // Each series is memoized on its raw query result (+ model selection) so the
+  // reference stays stable across the scheduler's page re-renders — that's what
+  // lets the chart's React.memo bail. (LFE-10549)
+  const costByType = useMemo(
+    () =>
+      queryCostByType.data && allModels.length > 0
+        ? fillMissingValuesAndTransform(
+            extractTimeSeriesData(queryCostByType.data, "intervalStart", [
+              {
+                uniqueIdentifierColumns: [{ accessor: "key" }],
+                valueColumn: "sum",
+              },
+            ]),
+            [],
+          )
+        : [],
+    [queryCostByType.data, allModels],
+  );
 
-  const unitsByType =
-    usageData && allModels.length > 0
-      ? fillMissingValuesAndTransform(
-          extractTimeSeriesData(usageData, "startTime", [
-            {
-              uniqueIdentifierColumns: [{ accessor: "usageType" }],
-              valueColumn: "units",
-            },
-          ]),
-          Array.from(usageTypeMap.keys()),
-        )
-      : [];
+  const unitsByType = useMemo(
+    () =>
+      queryUsageByType.data && allModels.length > 0
+        ? fillMissingValuesAndTransform(
+            extractTimeSeriesData(queryUsageByType.data, "intervalStart", [
+              {
+                uniqueIdentifierColumns: [{ accessor: "key" }],
+                valueColumn: "sum",
+              },
+            ]),
+            [],
+          )
+        : [],
+    [queryUsageByType.data, allModels],
+  );
 
-  const unitsByModel =
-    usageData && allModels.length > 0
-      ? fillMissingValuesAndTransform(
-          extractTimeSeriesData(usageData, "startTime", [
-            {
-              uniqueIdentifierColumns: [{ accessor: "model" }],
-              valueColumn: "units",
-            },
-          ]),
-          currentModels,
-        )
-      : [];
+  const unitsByModel = useMemo(
+    () =>
+      queryResult.data && allModels.length > 0
+        ? fillMissingValuesAndTransform(
+            extractTimeSeriesData(
+              queryResult.data as DatabaseRow[],
+              "time_dimension",
+              [
+                {
+                  uniqueIdentifierColumns: [{ accessor: "providedModelName" }],
+                  valueColumn: "sum_totalTokens",
+                },
+              ],
+            ),
+            selectedModels,
+          )
+        : [],
+    [queryResult.data, allModels, selectedModels],
+  );
 
-  const costByType =
-    usageData && allModels.length > 0
-      ? fillMissingValuesAndTransform(
-          extractTimeSeriesData(usageData, "startTime", [
-            {
-              uniqueIdentifierColumns: [{ accessor: "usageType" }],
-              valueColumn: "cost",
-            },
-          ]),
-          Array.from(usageTypeMap.keys()),
-        )
-      : [];
+  const costByModel = useMemo(
+    () =>
+      queryResult.data && allModels.length > 0
+        ? fillMissingValuesAndTransform(
+            extractTimeSeriesData(
+              queryResult.data as DatabaseRow[],
+              "time_dimension",
+              [
+                {
+                  uniqueIdentifierColumns: [{ accessor: "providedModelName" }],
+                  valueColumn: "sum_totalCost",
+                },
+              ],
+            ),
+            selectedModels,
+          )
+        : [],
+    [queryResult.data, allModels, selectedModels],
+  );
 
-  const costByModel =
-    usageData && allModels.length > 0
-      ? fillMissingValuesAndTransform(
-          extractTimeSeriesData(usageData, "startTime", [
-            {
-              uniqueIdentifierColumns: [{ accessor: "model" }],
-              valueColumn: "cost",
-            },
-          ]),
-          currentModels,
-        )
-      : [];
-
-  const totalCost = usageData?.reduce(
+  const totalCost = queryResult.data?.reduce(
     (acc, curr) =>
       acc +
-      (curr.usageType === "total" && !isNaN(curr.cost as number)
-        ? (curr.cost as number)
-        : 0),
+      (!isNaN(Number(curr.sum_totalCost)) ? Number(curr.sum_totalCost) : 0),
     0,
   );
 
-  const totalTokens = usageData?.reduce(
+  const totalTokens = queryResult.data?.reduce(
     (acc, curr) =>
       acc +
-      (curr.usageType === "total" && !isNaN(curr.units as number)
-        ? (curr.units as number)
-        : 0),
+      (!isNaN(Number(curr.sum_totalTokens)) ? Number(curr.sum_totalTokens) : 0),
     0,
   );
-
-  // had to add this function as tremor under the hodd adds more variables
-  // to the function call which would break usdFormatter.
-  const oneValueUsdFormatter = (value: number) => {
-    return totalCostDashboardFormatted(value);
-  };
 
   const data = [
     {
       tabTitle: "Cost by model",
       data: costByModel,
-      totalMetric: totalCostDashboardFormatted(totalCost),
+      totalMetric: costFormatter(totalCost),
       metricDescription: `Cost`,
-      formatter: oneValueUsdFormatter,
+      chartMetricLabel: "USD",
+      chartUnit: "USD",
     },
     {
       tabTitle: "Cost by type",
       data: costByType,
-      totalMetric: totalCostDashboardFormatted(totalCost),
+      totalMetric: costFormatter(totalCost),
       metricDescription: `Cost`,
-      formatter: oneValueUsdFormatter,
+      chartMetricLabel: "USD",
+      chartUnit: "USD",
     },
     {
-      tabTitle: "Units by model",
+      tabTitle: "Usage by model",
       data: unitsByModel,
       totalMetric: totalTokens
         ? compactNumberFormatter(totalTokens)
         : compactNumberFormatter(0),
       metricDescription: `Units`,
+      chartMetricLabel: "Tokens",
+      chartUnit: "tokens",
     },
     {
-      tabTitle: "Units by type",
+      tabTitle: "Usage by type",
       data: unitsByType,
       totalMetric: totalTokens
         ? compactNumberFormatter(totalTokens)
         : compactNumberFormatter(0),
       metricDescription: `Units`,
+      chartMetricLabel: "Tokens",
+      chartUnit: "tokens",
     },
   ];
 
@@ -268,66 +356,19 @@ export const ModelUsageChart = ({
     <DashboardCard
       className={className}
       title="Model Usage"
-      isLoading={queryResult.isLoading && selectedModels.length > 0}
+      isLoading={
+        isLoading || (queryResult.isPending && selectedModels.length > 0)
+      }
       headerRight={
         <div className="flex items-center justify-end">
-          <Popover open={open} onOpenChange={setOpen}>
-            <PopoverTrigger asChild>
-              <Button
-                variant="outline"
-                role="combobox"
-                aria-expanded={open}
-                className="w-56 justify-between"
-              >
-                {buttonText}
-                <ChevronsUpDown className="ml-2 h-4 w-4 shrink-0 opacity-50" />
-              </Button>
-            </PopoverTrigger>
-            <PopoverContent className="w-56 p-0">
-              <Command>
-                <CommandInput placeholder="Search models..." />
-                <CommandEmpty>No model found.</CommandEmpty>
-                <CommandGroup>
-                  <CommandItem onSelect={handleSelectAll}>
-                    <Check
-                      className={cn(
-                        "mr-2 h-4 w-4",
-                        isAllSelected ? "opacity-100" : "opacity-0",
-                      )}
-                    />
-                    <span>
-                      <p className="font-semibold">Select All</p>
-                    </span>
-                  </CommandItem>
-                  <CommandSeparator className="my-1" />
-                  <CommandList>
-                    {allModels.map((model) => (
-                      <CommandItem
-                        key={model}
-                        onSelect={() => {
-                          setSelectedModels((prev) =>
-                            prev.includes(model)
-                              ? prev.filter((m) => m !== model)
-                              : [...prev, model],
-                          );
-                        }}
-                      >
-                        <Check
-                          className={cn(
-                            "mr-2 h-4 w-4",
-                            selectedModels.includes(model)
-                              ? "opacity-100"
-                              : "opacity-0",
-                          )}
-                        />
-                        {!model || model === "" ? <i>none</i> : model}
-                      </CommandItem>
-                    ))}
-                  </CommandList>
-                </CommandGroup>
-              </Command>
-            </PopoverContent>
-          </Popover>
+          <ModelSelectorPopover
+            allModels={allModels}
+            selectedModels={selectedModels}
+            setSelectedModels={setSelectedModels}
+            buttonText={buttonText}
+            isAllSelected={isAllSelected}
+            handleSelectAll={handleSelectAll}
+          />
         </div>
       }
     >
@@ -343,15 +384,29 @@ export const ModelUsageChart = ({
                   className="mb-4"
                 />
                 {isEmptyTimeSeries({ data: item.data }) ||
-                queryResult.isLoading ? (
-                  <NoDataOrLoading isLoading={queryResult.isLoading} />
-                ) : (
-                  <BaseTimeSeriesChart
-                    agg={agg}
-                    data={item.data}
-                    showLegend={true}
-                    valueFormatter={item.formatter}
+                isLoading ||
+                queryResult.isPending ? (
+                  <NoDataOrLoading
+                    isLoading={isLoading || queryResult.isPending}
+                    className="h-auto grow"
                   />
+                ) : (
+                  // The height is the flex basis (floor); grow lets the chart absorb
+                  // extra tile height. On grid (lg) screens the floor is smaller so
+                  // tiles fit narrow viewports — grow recovers the height above the
+                  // grid's rowHeight floor. (LFE-10813)
+                  <div className="h-80 w-full shrink-0 grow lg:h-56">
+                    <DashboardLineTimeSeriesChart
+                      data={item.data}
+                      label={item.chartMetricLabel}
+                      unit={item.chartUnit}
+                      // Token/cost totals are additive sums. (LFE-10498)
+                      legendSummary="sum"
+                      syncId={syncId}
+                      // Additive sums: a bucket without data honestly sums to 0. (LFE-10694)
+                      missingValue="zero"
+                    />
+                  </div>
                 )}
               </>
             ),

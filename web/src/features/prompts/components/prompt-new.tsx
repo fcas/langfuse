@@ -1,16 +1,14 @@
 import { StringParam, useQueryParam } from "use-query-params";
-
-import Header from "@/src/components/layouts/header";
 import { NewPromptForm } from "@/src/features/prompts/components/NewPromptForm";
 import useProjectIdFromURL from "@/src/hooks/useProjectIdFromURL";
 import { api } from "@/src/utils/api";
-import { ScrollScreenPage } from "@/src/components/layouts/scroll-screen-page";
+import Page from "@/src/components/layouts/page";
 
 export const NewPrompt = () => {
   const projectId = useProjectIdFromURL();
   const [initialPromptId] = useQueryParam("promptId", StringParam);
 
-  const { data: initialPrompt, isInitialLoading } = api.prompts.byId.useQuery(
+  const { data: initialPrompt, isLoading } = api.prompts.byId.useQuery(
     {
       projectId: projectId as string, // Typecast as query is enabled only when projectId is present
       id: initialPromptId ?? "",
@@ -22,8 +20,8 @@ export const NewPrompt = () => {
     },
   );
 
-  if (isInitialLoading) {
-    return <div>Loading...</div>;
+  if (isLoading) {
+    return <div className="p-3">Loading...</div>;
   }
 
   const breadcrumb: { name: string; href?: string }[] = [
@@ -48,22 +46,23 @@ export const NewPrompt = () => {
   }
 
   return (
-    <ScrollScreenPage>
-      <Header
-        title={
-          initialPrompt
-            ? `${initialPrompt.name} \u2014 New version`
-            : "Create new prompt"
-        }
-        help={{
+    <Page
+      withPadding
+      scrollable
+      headerProps={{
+        title: initialPrompt
+          ? `${initialPrompt.name} \u2014 New version`
+          : "Create new prompt",
+        help: {
           description:
             "Manage and version your prompts in Langfuse. Edit and update them via the UI and SDK. Retrieve the production version via the SDKs. Learn more in the docs.",
           href: "https://langfuse.com/docs/prompts",
-        }}
-        breadcrumb={breadcrumb}
-      />
+        },
+        breadcrumb: breadcrumb,
+      }}
+    >
       {initialPrompt ? (
-        <p className="text-sm text-muted-foreground">
+        <p className="text-muted-foreground text-sm">
           Prompts are immutable in Langfuse. To update a prompt, create a new
           version.
         </p>
@@ -71,6 +70,6 @@ export const NewPrompt = () => {
       <div className="my-8">
         <NewPromptForm {...{ initialPrompt }} />
       </div>
-    </ScrollScreenPage>
+    </Page>
   );
 };

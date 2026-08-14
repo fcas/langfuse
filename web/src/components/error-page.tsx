@@ -4,7 +4,8 @@ import { useSession } from "next-auth/react";
 import { useRouter } from "next/router";
 import { useEffect } from "react";
 import Link from "next/link";
-import { captureException } from "@sentry/nextjs";
+import { reportError } from "@/src/utils/reportError";
+import { stripBasePath } from "@/src/utils/redirect";
 
 export const ErrorPage = ({
   title = "Error",
@@ -25,21 +26,22 @@ export const ErrorPage = ({
 }) => {
   const session = useSession();
   const router = useRouter();
-  const newTargetPath = router.asPath;
+  const newTargetPath = stripBasePath(router.asPath || "/");
+  // Only include targetPath if it's not the root (since "/" is the default anyway)
+  const targetPathQuery =
+    newTargetPath !== "/"
+      ? `?targetPath=${encodeURIComponent(newTargetPath)}`
+      : "";
 
   return (
-    <div className="flex h-screen flex-col items-center justify-center">
-      <AlertCircle className="mb-4 h-12 w-12 text-dark-red" />
+    <div className="flex h-full flex-col items-center justify-center">
+      <AlertCircle className="text-dark-red mb-4 h-12 w-12" />
       <h1 className="mb-4 text-xl font-bold">{title}</h1>
       <p className="mb-6 text-center">{message}</p>
       <div className="flex gap-3">
         {session.status === "unauthenticated" ? (
           <Button
-            onClick={() =>
-              void router.push(
-                `/auth/sign-in?targetPath=${encodeURIComponent(newTargetPath)}`,
-              )
-            }
+            onClick={() => router.push(`/auth/sign-in${targetPathQuery}`)}
           >
             Sign In
           </Button>
@@ -63,17 +65,37 @@ export const ErrorPage = ({
 export const ErrorPageWithSentry = ({
   title = "Error",
   message,
+  additionalButton,
+  expected = false,
 }: {
   title?: string;
   message: string;
+  additionalButton?:
+    | {
+        label: string;
+        href: string;
+      }
+    | {
+        label: string;
+        onClick: () => void;
+      };
+  /** Expected, user-caused outcome: breadcrumb instead of a Sentry error. */
+  expected?: boolean;
 }) => {
   useEffect(() => {
-    // Capture the error with Sentry
+    // Capture the error with Sentry (breadcrumb only when expected)
     if (window !== undefined)
-      captureException(
+      reportError(
         new Error(`ErrorPageWithSentry rendered: ${title}, ${message}`),
+        { area: "error-page", expected, extra: { title, message } },
       );
-  }, [title, message]); // Empty dependency array means this effect runs once on mount
+  }, [title, message, expected]);
 
-  return <ErrorPage title={title} message={message} />;
+  return (
+    <ErrorPage
+      title={title}
+      message={message}
+      additionalButton={additionalButton}
+    />
+  );
 };

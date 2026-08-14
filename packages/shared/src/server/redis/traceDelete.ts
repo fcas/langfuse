@@ -1,6 +1,6 @@
 import { QueueName, TQueueJobTypes } from "../queues";
 import { Queue } from "bullmq";
-import { createNewRedisInstance, redisQueueRetryOptions } from "./redis";
+import { createBullMQQueueOptionsWithRedis } from "./redis";
 import { logger } from "../logger";
 
 export class TraceDeleteQueue {
@@ -12,23 +12,21 @@ export class TraceDeleteQueue {
   > | null {
     if (TraceDeleteQueue.instance) return TraceDeleteQueue.instance;
 
-    const newRedis = createNewRedisInstance({
-      enableOfflineQueue: false,
-      ...redisQueueRetryOptions,
-    });
-
-    TraceDeleteQueue.instance = newRedis
+    const queueOptionsWithRedis = createBullMQQueueOptionsWithRedis(
+      QueueName.TraceDelete,
+    );
+    TraceDeleteQueue.instance = queueOptionsWithRedis
       ? new Queue<TQueueJobTypes[QueueName.TraceDelete]>(
           QueueName.TraceDelete,
           {
-            connection: newRedis,
+            ...queueOptionsWithRedis,
             defaultJobOptions: {
               removeOnComplete: true,
               removeOnFail: 100_000,
-              attempts: 5,
+              attempts: 2,
               backoff: {
                 type: "exponential",
-                delay: 5000,
+                delay: 30_000,
               },
             },
           },

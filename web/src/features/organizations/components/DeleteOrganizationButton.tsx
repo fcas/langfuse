@@ -1,8 +1,11 @@
+/* eslint-disable @repo/no-abstracted-overlay-trigger */
 import { Button } from "@/src/components/ui/button";
 import {
   Dialog,
+  DialogBody,
   DialogContent,
   DialogDescription,
+  DialogFooter,
   DialogHeader,
   DialogTitle,
   DialogTrigger,
@@ -15,7 +18,7 @@ import {
   FormMessage,
 } from "@/src/components/ui/form";
 import { Input } from "@/src/components/ui/input";
-import { api } from "@/src/utils/api";
+import { api, reportNonTrpcError } from "@/src/utils/api";
 import * as z from "zod";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -46,7 +49,7 @@ export function DeleteOrganizationButton() {
   const deleteOrganization = api.organizations.delete.useMutation();
   const hasProjects = !!organization && organization.projects.length > 0;
 
-  const form = useForm<z.infer<typeof formSchema>>({
+  const form = useForm({
     resolver: zodResolver(formSchema),
     defaultValues: {
       name: "",
@@ -67,7 +70,9 @@ export function DeleteOrganizationButton() {
       await new Promise((resolve) => setTimeout(resolve, 5000)); // Delay for 5 seconds
       window.location.href = env.NEXT_PUBLIC_BASE_PATH ?? "/"; // Browser reload to refresh jwt
     } catch (error) {
-      console.error(error);
+      // tRPC failures were already classified + toasted by the react-query
+      // default onError; only report failures of the post-success work here.
+      reportNonTrpcError(error, "organizations");
     }
   };
 
@@ -80,7 +85,7 @@ export function DeleteOrganizationButton() {
       </DialogTrigger>
       <DialogContent className="sm:max-w-[425px]">
         <DialogHeader>
-          <DialogTitle className="text-lg font-semibold">
+          <DialogTitle className="text-lg font-bold">
             Delete Organization
           </DialogTitle>
           <DialogDescription>
@@ -90,34 +95,34 @@ export function DeleteOrganizationButton() {
           </DialogDescription>
         </DialogHeader>
         <Form {...form}>
-          <form
-            // eslint-disable-next-line @typescript-eslint/no-misused-promises
-            onSubmit={form.handleSubmit(onSubmit)}
-            className="space-y-8"
-          >
+          <form onSubmit={form.handleSubmit(onSubmit)} className="space-y-8">
             {!hasProjects && (
-              <FormField
-                control={form.control}
-                name="name"
-                render={({ field }) => (
-                  <FormItem>
-                    <FormControl>
-                      <Input placeholder={confirmMessage} {...field} />
-                    </FormControl>
-                    <FormMessage />
-                  </FormItem>
-                )}
-              />
+              <DialogBody>
+                <FormField
+                  control={form.control}
+                  name="name"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormControl>
+                        <Input placeholder={confirmMessage} {...field} />
+                      </FormControl>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </DialogBody>
             )}
-            <Button
-              type="submit"
-              variant="destructive"
-              loading={deleteOrganization.isLoading}
-              disabled={hasProjects}
-              className="w-full"
-            >
-              Delete Organization
-            </Button>
+            <DialogFooter>
+              <Button
+                type="submit"
+                variant="destructive"
+                loading={deleteOrganization.isPending}
+                disabled={hasProjects}
+                className="w-full"
+              >
+                Delete Organization
+              </Button>
+            </DialogFooter>
           </form>
         </Form>
       </DialogContent>

@@ -1,5 +1,13 @@
 import { z } from "zod";
 
+import {
+  datasetItemMediaFields,
+  MediaContentType,
+  MediaFileExtension,
+} from "@langfuse/shared";
+
+export { MediaContentType, MediaFileExtension };
+
 export enum MediaEnabledFields {
   Input = "input",
   Output = "output",
@@ -10,73 +18,8 @@ export enum MediaEnabledFields {
   When adding new media content types, also update the supported content types in the server definition
   in fern/apis/server/definition/media.yml and reflect the changes in the SDKs.
  */
-export enum MediaContentType {
-  PNG = "image/png",
-  JPEG = "image/jpeg",
-  JPG = "image/jpg",
-  WEBP = "image/webp",
-  GIF = "image/gif",
-  SVG = "image/svg+xml",
-  TIFF = "image/tiff",
-  BMP = "image/bmp",
-  MP3 = "audio/mpeg",
-  MP3_LEGACY = "audio/mp3",
-  WAV = "audio/wav",
-  OGG = "audio/ogg",
-  OGA = "audio/oga",
-  AAC = "audio/aac",
-  M4A = "audio/mp4",
-  FLAC = "audio/flac",
-  MP4 = "video/mp4",
-  WEBM = "video/webm",
-  TXT = "text/plain",
-  HTML = "text/html",
-  CSS = "text/css",
-  CSV = "text/csv",
-  PDF = "application/pdf",
-  DOC = "application/msword",
-  XLS = "application/vnd.ms-excel",
-  ZIP = "application/zip",
-  JSON = "application/json",
-  XML = "application/xml",
-  BIN = "application/octet-stream",
-}
-
-export enum MediaFileExtension {
-  PNG = "png",
-  JPG = "jpg",
-  JPEG = "jpeg",
-  WEBP = "webp",
-  GIF = "gif",
-  SVG = "svg",
-  TIFF = "tiff",
-  BMP = "bmp",
-  MP3 = "mp3",
-  WAV = "wav",
-  OGG = "ogg",
-  OGA = "oga",
-  AAC = "aac",
-  M4A = "m4a",
-  FLAC = "flac",
-  MP4 = "mp4",
-  WEBM = "webm",
-  TXT = "txt",
-  HTML = "html",
-  CSS = "css",
-  CSV = "csv",
-  PDF = "pdf",
-  DOC = "doc",
-  XLS = "xls",
-  ZIP = "zip",
-  JSON = "json",
-  XML = "xml",
-  BIN = "bin",
-}
-
-export const GetMediaUploadUrlQuerySchema = z.object({
-  traceId: z.string(),
-  observationId: z.string().nullish(),
-  contentType: z.nativeEnum(MediaContentType, {
+const commonMediaUploadFields = {
+  contentType: z.enum(MediaContentType, {
     message: `Invalid content type. Only supporting ${Object.values(
       MediaContentType,
     ).join(", ")}`,
@@ -88,12 +31,38 @@ export const GetMediaUploadUrlQuerySchema = z.object({
       /^[A-Za-z0-9+/=]{44}$/,
       "Must be a 44 character base64 encoded SHA-256 hash",
     ),
-  field: z.nativeEnum(MediaEnabledFields, {
-    message: `Invalid field. Only supporting ${Object.values(
-      MediaEnabledFields,
-    ).join(", ")}`,
-  }),
+};
+
+// Media is attached to exactly one context: a trace/observation, or a dataset
+// item (which need not exist yet). The union enforces the required ids and the
+// per-context field set. The absent context's ids may be omitted or sent as
+// null (the active side still demands real strings, so the XOR holds) — this
+// lets SDKs that serialize unset fields as null validate without omitting keys.
+const TraceMediaUploadSchema = z.object({
+  ...commonMediaUploadFields,
+  traceId: z.string(),
+  observationId: z.string().nullish(),
+  field: z.enum(Object.values(MediaEnabledFields) as [string, ...string[]]),
+  datasetId: z.null().optional(),
+  datasetItemId: z.null().optional(),
 });
+
+const DatasetItemMediaUploadSchema = z.object({
+  ...commonMediaUploadFields,
+  datasetId: z.string(),
+  datasetItemId: z.string(),
+  field: z.enum(datasetItemMediaFields),
+  traceId: z.null().optional(),
+  observationId: z.null().optional(),
+});
+
+export const GetMediaUploadUrlQuerySchema = z.union(
+  [TraceMediaUploadSchema, DatasetItemMediaUploadSchema],
+  {
+    message:
+      "Provide either traceId with field input/output/metadata, or datasetId + datasetItemId with field input/expectedOutput/metadata.",
+  },
+);
 
 export type GetMediaUploadUrlQuery = z.infer<
   typeof GetMediaUploadUrlQuerySchema
@@ -136,11 +105,11 @@ export type GetMediaResponse = z.infer<typeof GetMediaResponseSchema>;
 
 export const MediaReturnSchema = z.object({
   mediaId: z.string(),
-  contentType: z.nativeEnum(MediaContentType),
+  contentType: z.enum(MediaContentType),
   contentLength: z.coerce.number(),
   url: z.string(),
   urlExpiry: z.string(),
-  field: z.nativeEnum(MediaEnabledFields),
+  field: z.enum(MediaEnabledFields),
 });
 
 export type MediaReturnType = z.infer<typeof MediaReturnSchema>;

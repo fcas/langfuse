@@ -30,7 +30,7 @@ function useSessionStorage<T>(
       const storedValue = sessionStorage.getItem(sessionStorageKey);
       return storedValue ? (JSON.parse(storedValue) as T) : initialValue;
     } catch (error) {
-      console.error("Error reading from session storage", error);
+      console.warn("Error reading from session storage", error);
       return initialValue;
     }
   });
@@ -40,15 +40,16 @@ function useSessionStorage<T>(
       sessionStorage.removeItem(sessionStorageKey);
       setValue(initialValue);
     } catch (error) {
-      console.error("Error clearing session storage", error);
+      console.warn("Error clearing session storage", error);
     }
   };
 
+  // Sync state with sessionStorage changes across tabs
   useEffect(() => {
     try {
       sessionStorage.setItem(sessionStorageKey, JSON.stringify(value));
     } catch (error) {
-      console.error("Error writing to session storage", error);
+      console.warn("Error writing to session storage", error);
     }
   }, [sessionStorageKey, value]);
 

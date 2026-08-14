@@ -1,25 +1,32 @@
 import { Button } from "@/src/components/ui/button";
 import { cn } from "@/src/utils/tailwind";
+import { TagIcon } from "lucide-react";
 import React from "react";
 
 export const TagButton: React.FC<{
   tag: string;
   loading: boolean;
   viewOnly?: boolean;
-}> = React.memo(({ tag, loading, viewOnly = false }) => (
+  isTableCell?: boolean;
+}> = React.memo(({ tag, loading, viewOnly = false, isTableCell = false }) => (
   <Button
     key={tag}
-    variant="secondary"
-    size="xs"
+    variant="tertiary"
+    size="icon-sm"
     disabled={viewOnly}
-    className={cn(
-      "text-xs font-semibold",
-      !viewOnly && "hover:bg-background",
-      viewOnly && "cursor-default",
-    )}
+    className={cn(viewOnly && "cursor-default", "w-fit max-w-40 min-w-16")}
     loading={loading}
   >
-    {tag}
+    <TagIcon className="mr-1 h-3.5 w-3.5 shrink-0" />
+    <span
+      className={cn(
+        "overflow-hidden text-ellipsis whitespace-nowrap",
+        !isTableCell && "text-xs",
+      )}
+      title={tag}
+    >
+      {tag}
+    </span>
   </Button>
 ));
 TagButton.displayName = "TagButton";

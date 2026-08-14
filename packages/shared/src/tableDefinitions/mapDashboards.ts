@@ -1,6 +1,8 @@
-import { UiColumnMapping } from "./types";
+import { UiColumnMappings } from "./types";
 
-export const dashboardColumnDefinitions: UiColumnMapping[] = [
+// Make sure to update web/src/features/dashboard/lib/dashboardUiTableToViewMapping.ts if you make changes
+
+export const dashboardColumnDefinitions: UiColumnMappings = [
   {
     uiTableName: "Trace Name",
     uiTableId: "traceName",
@@ -68,6 +70,12 @@ export const dashboardColumnDefinitions: UiColumnMapping[] = [
     uiTableName: "Type",
   },
   {
+    clickhouseTableName: "observations",
+    clickhouseSelect: "o.level",
+    uiTableId: "level",
+    uiTableName: "Level",
+  },
+  {
     clickhouseTableName: "traces",
     clickhouseSelect: "t.user_id",
     uiTableId: "userId",
@@ -90,5 +98,24 @@ export const dashboardColumnDefinitions: UiColumnMapping[] = [
     clickhouseSelect: "provided_model_name",
     uiTableId: "model",
     uiTableName: "Model",
+  },
+  {
+    clickhouseTableName: "observations",
+    clickhouseSelect: "mapKeys(tool_definitions)",
+    uiTableId: "toolNames",
+    uiTableName: "Tool Names (Available)",
+    aliases: ["Tool Names"],
+  },
+  {
+    clickhouseTableName: "observations",
+    clickhouseSelect: "tool_call_names",
+    uiTableId: "calledToolNames",
+    uiTableName: "Tool Names (Called)",
+  },
+  {
+    clickhouseTableName: "traces",
+    clickhouseSelect: "environment",
+    uiTableId: "environment",
+    uiTableName: "Environment",
   },
 ];

@@ -1,118 +1,121 @@
 import { Button } from "@/src/components/ui/button";
-import { api } from "@/src/utils/api";
+import { Dialog, DialogTrigger } from "@/src/components/ui/dialog";
+import { api, reportNonTrpcError } from "@/src/utils/api";
 import { useState } from "react";
 import { PlusIcon } from "lucide-react";
-import {
-  Dialog,
-  DialogContent,
-  DialogTitle,
-  DialogTrigger,
-} from "@/src/components/ui/dialog";
-import { CodeView } from "@/src/components/ui/CodeJsonViewer";
 import { useHasProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
-import { QuickstartExamples } from "@/src/features/public-api/components/QuickstartExamples";
+import { useHasOrganizationAccess } from "@/src/features/rbac/utils/checkOrganizationAccess";
 import { usePostHogClientCapture } from "@/src/features/posthog-analytics/usePostHogClientCapture";
-import { useUiCustomization } from "@/src/ee/features/ui-customization/useUiCustomization";
-import { env } from "@/src/env.mjs";
+import { useLangfuseBaseUrl } from "@/src/features/public-api/hooks/useLangfuseEnvCode";
+import { ApiKeyCreateDialogContent } from "@/src/features/public-api/components/ApiKeyCreateDialogContent";
 
-export function CreateApiKeyButton(props: { projectId: string }) {
+type ApiKeyScope = "project" | "organization";
+
+export function CreateApiKeyButton(props: {
+  entityId: string;
+  scope: ApiKeyScope;
+}) {
   const utils = api.useUtils();
   const capture = usePostHogClientCapture();
-  const hasAccess = useHasProjectAccess({
-    projectId: props.projectId,
+
+  const hasProjectAccess = useHasProjectAccess({
+    projectId: props.entityId,
     scope: "apiKeys:CUD",
   });
-
-  const mutCreateApiKey = api.apiKeys.create.useMutation({
-    onSuccess: () => utils.apiKeys.invalidate(),
+  const hasOrganizationAccess = useHasOrganizationAccess({
+    organizationId: props.entityId,
+    scope: "organization:CRUD_apiKeys",
   });
+
+  const hasAccess =
+    props.scope === "project" ? hasProjectAccess : hasOrganizationAccess;
+
+  const mutCreateProjectApiKey = api.projectApiKeys.create.useMutation({
+    onSuccess: () => utils.projectApiKeys.invalidate(),
+  });
+  const mutCreateOrgApiKey = api.organizationApiKeys.create.useMutation({
+    onSuccess: () => utils.organizationApiKeys.invalidate(),
+  });
+
   const [open, setOpen] = useState(false);
+  const [note, setNote] = useState("");
   const [generatedKeys, setGeneratedKeys] = useState<{
     secretKey: string;
     publicKey: string;
   } | null>(null);
+  const baseUrl = useLangfuseBaseUrl();
+
+  const handleOpenChange = (newOpen: boolean) => {
+    setOpen(newOpen);
+    if (!newOpen) {
+      // Reset state when closing
+      setGeneratedKeys(null);
+      setNote("");
+    }
+  };
 
   const createApiKey = () => {
-    if (open) {
-      setOpen(false);
-      setGeneratedKeys(null);
-    } else {
-      mutCreateApiKey
+    if (props.scope === "project") {
+      mutCreateProjectApiKey
         .mutateAsync({
-          projectId: props.projectId,
+          projectId: props.entityId,
+          note: note || undefined,
         })
         .then(({ secretKey, publicKey }) => {
           setGeneratedKeys({
             secretKey,
             publicKey,
           });
-          setOpen(true);
-          capture("project_settings:api_key_create");
+          capture(`${props.scope}_settings:api_key_create`);
         })
-        .catch((error) => {
-          console.error(error);
-        });
+        .catch((error) => reportNonTrpcError(error, "api-keys"));
+    } else {
+      mutCreateOrgApiKey
+        .mutateAsync({
+          orgId: props.entityId,
+          note: note || undefined,
+        })
+        .then(({ secretKey, publicKey }) => {
+          setGeneratedKeys({
+            secretKey,
+            publicKey,
+          });
+          capture(`${props.scope}_settings:api_key_create`);
+        })
+        .catch((error) => reportNonTrpcError(error, "api-keys"));
     }
   };
 
   if (!hasAccess) return null;
 
   return (
-    <Dialog open={open} onOpenChange={createApiKey}>
+    <Dialog open={open} onOpenChange={handleOpenChange}>
       <DialogTrigger asChild>
-        <Button variant="secondary" loading={mutCreateApiKey.isLoading}>
-          <PlusIcon className="-ml-0.5 mr-1.5 h-5 w-5" aria-hidden="true" />
+        <Button variant="secondary">
+          <PlusIcon className="mr-1.5 -ml-0.5 h-5 w-5" aria-hidden="true" />
           Create new API keys
         </Button>
       </DialogTrigger>
-      <DialogContent
-        onPointerDownOutside={(e) => e.preventDefault()}
-        className="flex max-h-screen w-full flex-col md:max-w-xl"
-      >
-        <DialogTitle>API Keys</DialogTitle>
-        <div className="shrink overflow-x-hidden overflow-y-scroll">
-          <ApiKeyRender generatedKeys={generatedKeys ?? undefined} />
-          {generatedKeys && (
-            <div className="mt-4 max-w-full">
-              <div className="text-md my-2 font-semibold">Usage</div>
-              <QuickstartExamples
-                secretKey={generatedKeys.secretKey}
-                publicKey={generatedKeys.publicKey}
-              />
-            </div>
-          )}
-        </div>
-      </DialogContent>
+      <ApiKeyCreateDialogContent
+        scope={props.scope}
+        {...(generatedKeys
+          ? {
+              type: "detail" as const,
+              secretKey: generatedKeys.secretKey,
+              publicKey: generatedKeys.publicKey,
+              baseUrl,
+              showMcpSection: true,
+            }
+          : {
+              type: "form" as const,
+              note,
+              onNoteChange: setNote,
+              onSubmit: createApiKey,
+              isPending:
+                mutCreateProjectApiKey.isPending ||
+                mutCreateOrgApiKey.isPending,
+            })}
+      />
     </Dialog>
   );
 }
-
-export const ApiKeyRender = ({
-  generatedKeys,
-}: {
-  generatedKeys?: { secretKey: string; publicKey: string };
-}) => {
-  const uiCustomization = useUiCustomization();
-  return (
-    <>
-      <div className="mb-4">
-        <div className="text-md font-semibold">Secret Key</div>
-        <div className="my-2 text-sm">
-          This key can only be viewed once. You can always create new keys in
-          the project settings.
-        </div>
-        <CodeView content={generatedKeys?.secretKey ?? "Loading ..."} />
-      </div>
-      <div className="mb-4">
-        <div className="text-md mb-2 font-semibold">Public Key</div>
-        <CodeView content={generatedKeys?.publicKey ?? "Loading ..."} />
-      </div>
-      <div>
-        <div className="text-md mb-2 font-semibold">Host</div>
-        <CodeView
-          content={`${uiCustomization?.hostname ?? window.origin}${env.NEXT_PUBLIC_BASE_PATH ?? ""}`}
-        />
-      </div>
-    </>
-  );
-};

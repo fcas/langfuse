@@ -4,96 +4,99 @@ import {
   GetObservationV1Response,
   transformDbToApiObservation,
 } from "@/src/features/public-api/types/observations";
-import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { createAuthedAPIRoute } from "@/src/features/public-api/server/createAuthedAPIRoute";
+import {
+  LEGACY_PUBLIC_API_OBSERVATIONS_CLICKHOUSE_RESOURCE_ERROR_MESSAGE,
+  withMiddlewares,
+} from "@/src/features/public-api/server/withMiddlewares";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
 import { LangfuseNotFoundError } from "@langfuse/shared";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
-import { getObservationViewById } from "@langfuse/shared/src/server";
+import {
+  enrichObservationWithModelData,
+  getObservationById,
+  getObservationByIdFromEventsTable,
+} from "@langfuse/shared/src/server";
+import { legacyPublicApiRateLimitUpgradePaths } from "@/src/features/public-api/server/rateLimitUpgradePaths";
+import { OBSERVATIONS_V1_DEPRECATION } from "@/src/features/public-api/server/deprecations";
 
-export default withMiddlewares({
-  GET: createAuthedAPIRoute({
-    name: "Get Observation",
-    querySchema: GetObservationV1Query,
-    responseSchema: GetObservationV1Response,
-    fn: async ({ query, auth }) => {
-      const { observationId } = query;
-      const observation = await measureAndReturnApi({
-        input: { projectId: auth.scope.projectId, queryClickhouse: false },
-        operation: "api/public/observations/[observationId]",
-        user: null,
-        pgExecution: async () => {
-          return await prisma.observationView.findFirst({
-            where: {
-              id: observationId,
+export default withMiddlewares(
+  {
+    GET: createAuthedProjectAPIRoute({
+      name: "Get Observation",
+      allowInAppAgentKey: true,
+      rateLimitResource: "public-api-legacy",
+      querySchema: GetObservationV1Query,
+      responseSchema: GetObservationV1Response,
+      rateLimitUpgradePath: legacyPublicApiRateLimitUpgradePaths.observationGet,
+      rejectInEventsOnlyMode: true,
+      deprecation: OBSERVATIONS_V1_DEPRECATION,
+      fn: async ({ query, auth }) => {
+        const clickhouseObservation = query.useEventsTable
+          ? await getObservationByIdFromEventsTable({
+              id: query.observationId,
               projectId: auth.scope.projectId,
-            },
-          });
-        },
-        clickhouseExecution: async () => {
-          const observation = await getObservationViewById(
-            observationId,
-            auth.scope.projectId,
-            true,
+              fetchWithInputOutput: true,
+            })
+          : // eslint-disable-next-line @typescript-eslint/no-deprecated
+            await getObservationById({
+              id: query.observationId,
+              projectId: auth.scope.projectId,
+              fetchWithInputOutput: true,
+              preferredClickhouseService: "ReadOnly",
+            });
+
+        if (!clickhouseObservation) {
+          throw new LangfuseNotFoundError(
+            "Observation not found within authorized project",
           );
-          if (!observation) {
-            throw new LangfuseNotFoundError(
-              "Observation not found within authorized project",
-            );
-          }
+        }
 
-          const model = observation.modelId
-            ? await prisma.model.findFirst({
-                where: {
-                  AND: [
-                    {
-                      id: observation.modelId,
-                    },
-                    {
-                      OR: [
-                        {
-                          projectId: auth.scope.projectId,
-                        },
-                        {
-                          projectId: null,
-                        },
-                      ],
-                    },
-                  ],
-                },
-                include: {
-                  Price: true,
-                },
-                orderBy: {
-                  projectId: {
-                    sort: "desc",
-                    nulls: "last",
+        const model = clickhouseObservation.internalModelId
+          ? await prisma.model.findFirst({
+              where: {
+                AND: [
+                  {
+                    id: clickhouseObservation.internalModelId,
                   },
+                  {
+                    OR: [
+                      {
+                        projectId: auth.scope.projectId,
+                      },
+                      {
+                        projectId: null,
+                      },
+                    ],
+                  },
+                ],
+              },
+              include: {
+                Price: true,
+              },
+              orderBy: {
+                projectId: {
+                  sort: "desc",
+                  nulls: "last",
                 },
-              })
-            : undefined;
+              },
+            })
+          : undefined;
 
-          // eslint-disable-next-line @typescript-eslint/no-unused-vars
+        const observation = {
+          ...clickhouseObservation,
+          ...enrichObservationWithModelData(model),
+        };
 
-          return {
-            ...observation,
-            modelId: model?.id ?? null,
-            inputPrice:
-              model?.Price?.find((m) => m.usageType === "input")?.price ?? null,
-            outputPrice:
-              model?.Price?.find((m) => m.usageType === "output")?.price ??
-              null,
-            totalPrice:
-              model?.Price?.find((m) => m.usageType === "total")?.price ?? null,
-          };
-        },
-      });
-
-      if (!observation) {
-        throw new LangfuseNotFoundError(
-          "Observation not found within authorized project",
-        );
-      }
-      return transformDbToApiObservation(observation);
-    },
-  }),
-});
+        if (!observation) {
+          throw new LangfuseNotFoundError(
+            "Observation not found within authorized project",
+          );
+        }
+        return transformDbToApiObservation(observation);
+      },
+    }),
+  },
+  {
+    clickHouseResourceErrorMessage:
+      LEGACY_PUBLIC_API_OBSERVATIONS_CLICKHOUSE_RESOURCE_ERROR_MESSAGE,
+  },
+);

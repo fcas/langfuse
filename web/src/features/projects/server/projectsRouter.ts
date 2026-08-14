@@ -5,6 +5,7 @@ import {
 } from "@/src/server/api/trpc";
 import * as z from "zod";
 import { throwIfNoProjectAccess } from "@/src/features/rbac/utils/checkProjectAccess";
+import { throwIfNoEntitlement } from "@/src/features/entitlements/server/hasEntitlement";
 import { TRPCError } from "@trpc/server";
 import { projectNameSchema } from "@/src/features/auth/lib/projectNameSchema";
 import { auditLog } from "@/src/features/audit-logs/auditLog";
@@ -14,14 +15,17 @@ import {
   QueueJobs,
   redis,
   ProjectDeleteQueue,
+  getEnvironmentsForProject,
 } from "@langfuse/shared/src/server";
 import { randomUUID } from "crypto";
+import { StringNoHTMLNonEmpty } from "@langfuse/shared";
+import { buildAdminOrgContext } from "@/src/features/organizations/server/adminOrgContext";
 
 export const projectsRouter = createTRPCRouter({
   create: protectedOrganizationProcedure
     .input(
       z.object({
-        name: z.string(),
+        name: StringNoHTMLNonEmpty,
         orgId: z.string(),
       }),
     )
@@ -36,6 +40,7 @@ export const projectsRouter = createTRPCRouter({
         where: {
           name: input.name,
           orgId: input.orgId,
+          deletedAt: null,
         },
       });
 
@@ -82,6 +87,25 @@ export const projectsRouter = createTRPCRouter({
         scope: "project:update",
       });
 
+      // check if the project name is already taken by another project
+      const otherProjectWithSameName = await ctx.prisma.project.findFirst({
+        where: {
+          name: input.newName,
+          orgId: ctx.session.orgId,
+          deletedAt: null,
+          id: {
+            not: input.projectId,
+          },
+        },
+      });
+      if (otherProjectWithSameName) {
+        throw new TRPCError({
+          code: "CONFLICT",
+          message:
+            "A project with this name already exists in your organization",
+        });
+      }
+
       const project = await ctx.prisma.project.update({
         where: {
           id: input.projectId,
@@ -89,6 +113,46 @@ export const projectsRouter = createTRPCRouter({
         },
         data: {
           name: input.newName,
+        },
+      });
+      await auditLog({
+        session: ctx.session,
+        resourceType: "project",
+        resourceId: input.projectId,
+        action: "update",
+        after: project,
+      });
+      return true;
+    }),
+
+  setRetention: protectedProjectProcedure
+    .input(
+      z.object({
+        projectId: z.string(),
+        retention: z.number().int().gte(3).nullable(),
+      }),
+    )
+    .mutation(async ({ input, ctx }) => {
+      throwIfNoProjectAccess({
+        session: ctx.session,
+        projectId: input.projectId,
+        scope: "project:update",
+      });
+      if (input.retention !== null && input.retention > 0) {
+        throwIfNoEntitlement({
+          entitlement: "data-retention",
+          sessionUser: ctx.session.user,
+          projectId: input.projectId,
+        });
+      }
+
+      const project = await ctx.prisma.project.update({
+        where: {
+          id: input.projectId,
+          orgId: ctx.session.orgId,
+        },
+        data: {
+          retentionDays: input.retention,
         },
       });
       await auditLog({
@@ -113,38 +177,22 @@ export const projectsRouter = createTRPCRouter({
         projectId: ctx.session.projectId,
         scope: "project:delete",
       });
-      const beforeProject = await ctx.prisma.project.findUnique({
-        where: {
-          id: input.projectId,
-        },
-      });
-      if (!beforeProject) {
-        throw new TRPCError({
-          code: "NOT_FOUND",
-          message: "Project not found",
-        });
-      }
-      await auditLog({
-        session: ctx.session,
-        resourceType: "project",
-        resourceId: input.projectId,
-        before: beforeProject,
-        action: "delete",
-      });
 
-      // Delete API keys from DB first
+      // API keys need to be deleted from cache. Otherwise, they will still be valid.
+      await new ApiAuthService(
+        ctx.prisma,
+        redis,
+      ).invalidateCachedProjectApiKeys(input.projectId);
+
+      // Delete API keys from DB
       await ctx.prisma.apiKey.deleteMany({
         where: {
           projectId: input.projectId,
+          scope: "PROJECT",
         },
       });
 
-      // API keys need to be deleted from cache. Otherwise, they will still be valid.
-      await new ApiAuthService(ctx.prisma, redis).invalidateProjectApiKeys(
-        input.projectId,
-      );
-
-      await ctx.prisma.project.update({
+      const project = await ctx.prisma.project.update({
         where: {
           id: input.projectId,
           orgId: ctx.session.orgId,
@@ -152,6 +200,14 @@ export const projectsRouter = createTRPCRouter({
         data: {
           deletedAt: new Date(),
         },
+      });
+
+      await auditLog({
+        session: ctx.session,
+        resourceType: "project",
+        resourceId: input.projectId,
+        before: project,
+        action: "delete",
       });
 
       const projectDeleteQueue = ProjectDeleteQueue.getInstance();
@@ -238,8 +294,34 @@ export const projectsRouter = createTRPCRouter({
 
       // API keys need to be deleted from cache. Otherwise, they will still be valid.
       // It has to be called after the db is done to prevent new API keys from being cached.
-      await new ApiAuthService(ctx.prisma, redis).invalidateProjectApiKeys(
-        input.projectId,
+      await new ApiAuthService(
+        ctx.prisma,
+        redis,
+      ).invalidateCachedProjectApiKeys(input.projectId);
+    }),
+
+  environmentFilterOptions: protectedProjectProcedure
+    .input(
+      z.object({ projectId: z.string(), fromTimestamp: z.date().optional() }),
+    )
+    .query(async ({ input }) => getEnvironmentsForProject(input)),
+
+  // Admin-only fallback for useProject: returns the project and its org in the
+  // same shape as session.user.organizations[number], since admins are not
+  // members of customer projects and have no session entry.
+  byId: protectedProjectProcedure
+    .input(z.object({ projectId: z.string() }))
+    .query(async ({ ctx }) => {
+      const organization = await buildAdminOrgContext(ctx);
+      const project = organization?.projects.find(
+        (p) => p.id === ctx.session.projectId,
       );
+      if (!organization || !project) {
+        throw new TRPCError({
+          code: "NOT_FOUND",
+          message: "Project not found",
+        });
+      }
+      return { project, organization };
     }),
 });

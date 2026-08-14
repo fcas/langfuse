@@ -4,78 +4,57 @@ import {
   GetSessionV1Response,
 } from "@/src/features/public-api/types/sessions";
 import { withMiddlewares } from "@/src/features/public-api/server/withMiddlewares";
-import { createAuthedAPIRoute } from "@/src/features/public-api/server/createAuthedAPIRoute";
+import { createAuthedProjectAPIRoute } from "@/src/features/public-api/server/createAuthedProjectAPIRoute";
 import { LangfuseNotFoundError } from "@langfuse/shared";
-import { measureAndReturnApi } from "@/src/server/utils/checkClickhouseAccess";
 import { getTracesBySessionId } from "@langfuse/shared/src/server";
+import { legacyPublicApiRateLimitUpgradePaths } from "@/src/features/public-api/server/rateLimitUpgradePaths";
+import { SESSIONS_DEPRECATION } from "@/src/features/public-api/server/deprecations";
 
 export default withMiddlewares({
-  GET: createAuthedAPIRoute({
+  GET: createAuthedProjectAPIRoute({
     name: "Get Session",
+    deprecation: SESSIONS_DEPRECATION,
+    rateLimitResource: "public-api-legacy",
     querySchema: GetSessionV1Query,
     responseSchema: GetSessionV1Response,
+    rateLimitUpgradePath: legacyPublicApiRateLimitUpgradePaths.sessionGet,
+    // Reads from the legacy traces ClickHouse table via getTracesBySessionId,
+    // which has no events_full fallback.
+    rejectInEventsOnlyMode: true,
     fn: async ({ query, auth }) => {
       const { sessionId } = query;
-
-      return await measureAndReturnApi({
-        input: { projectId: auth.scope.projectId, queryClickhouse: false },
-        operation: "scores.countAll",
-        user: null,
-        pgExecution: async () => {
-          const session = await prisma.traceSession.findUnique({
-            where: {
-              id_projectId: {
-                id: sessionId,
-                projectId: auth.scope.projectId,
-              },
-            },
-            select: {
-              id: true,
-              createdAt: true,
-              projectId: true,
-              traces: true,
-            },
-          });
-
-          if (!session) {
-            throw new LangfuseNotFoundError(
-              "Session not found within authorized project",
-            );
-          }
-
-          return session;
+      const session = await prisma.traceSession.findUnique({
+        where: {
+          id_projectId: {
+            id: sessionId,
+            projectId: auth.scope.projectId,
+          },
         },
-        clickhouseExecution: async () => {
-          const session = await prisma.traceSession.findUnique({
-            where: {
-              id_projectId: {
-                id: sessionId,
-                projectId: auth.scope.projectId,
-              },
-            },
-            select: {
-              id: true,
-              createdAt: true,
-              projectId: true,
-            },
-          });
-
-          if (!session) {
-            throw new LangfuseNotFoundError(
-              "Session not found within authorized project",
-            );
-          }
-
-          const traces = await getTracesBySessionId(auth.scope.projectId, [
-            sessionId,
-          ]);
-
-          return {
-            ...session,
-            traces,
-          };
+        select: {
+          id: true,
+          createdAt: true,
+          projectId: true,
+          environment: true,
         },
       });
+
+      if (!session) {
+        throw new LangfuseNotFoundError(
+          "Session not found within authorized project",
+        );
+      }
+
+      const traces = await getTracesBySessionId(auth.scope.projectId, [
+        sessionId,
+      ]);
+
+      return {
+        ...session,
+        traces: traces.map((trace) => ({
+          ...trace,
+          externalId: null,
+        })),
+      };
     },
   }),
 });

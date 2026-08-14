@@ -1,4 +1,4 @@
-import type Redis from "ioredis";
+import { type Redis, type Cluster } from "ioredis";
 import { type z } from "zod";
 import { RateLimiterRedis, RateLimiterRes } from "rate-limiter-flexible";
 import { env } from "@/src/env.mjs";
@@ -12,8 +12,36 @@ import {
   recordIncrement,
   type ApiAccessScope,
   logger,
+  createNewRedisInstance,
+  redisQueueRetryOptions,
 } from "@langfuse/shared/src/server";
+import { env as sharedEnv } from "@langfuse/shared/src/env";
 import { type NextApiResponse } from "next";
+import {
+  createUnstablePublicApiRateLimitError,
+  sendUnstablePublicApiErrorResponse,
+  type PublicApiErrorContract,
+} from "@/src/features/public-api/server/unstable-public-api-error-contract";
+import { type RateLimitUpgradePath } from "@/src/features/public-api/server/rateLimitUpgradePaths";
+
+export const RATE_LIMIT_REDIS_KEY_PREFIX = "rate-limit";
+
+export type RateLimitResponseOptions = {
+  errorContract?: PublicApiErrorContract | undefined;
+  upgradePath?: RateLimitUpgradePath | undefined;
+};
+
+export type RateLimitResponseOptionsInput =
+  | PublicApiErrorContract
+  | RateLimitResponseOptions;
+
+const normalizeRateLimitResponseOptions = (
+  options?: RateLimitResponseOptionsInput,
+): RateLimitResponseOptions => {
+  return typeof options === "string"
+    ? { errorContract: options }
+    : (options ?? {});
+};
 
 // Business Logic
 // - rate limit strategy is based on org-id, org plan, and resources. Rate limits are applied in buckets of minutes.
@@ -22,10 +50,31 @@ import { type NextApiResponse } from "next";
 // - isRateLimited returns false for self-hosters
 // - sendRestResponseIfLimited sends a 429 response with headers if the rate limit is exceeded. Return this from the route handler.
 export class RateLimitService {
-  private redis: Redis | null;
+  private static redis: Redis | Cluster | null;
+  private static instance: RateLimitService | null = null;
 
-  constructor(redis: Redis | null) {
-    this.redis = redis;
+  public static getInstance(redis: Redis | null = null) {
+    if (!RateLimitService.instance) {
+      RateLimitService.redis =
+        redis ??
+        createNewRedisInstance({
+          keyPrefix: sharedEnv.REDIS_KEY_PREFIX ?? undefined, // For multi-tenant Redis isolation
+          enableAutoPipelining: false, // This may help avoid https://github.com/redis/ioredis/issues/1931
+          enableOfflineQueue: false,
+          lazyConnect: true, // Connect when first command is sent
+          ...redisQueueRetryOptions,
+        });
+      RateLimitService.instance = new RateLimitService();
+    }
+    return RateLimitService.instance;
+  }
+
+  public static shutdown() {
+    if (RateLimitService.redis && RateLimitService.redis.status !== "end") {
+      RateLimitService.redis.disconnect();
+    }
+    RateLimitService.redis = null;
+    RateLimitService.instance = null;
   }
 
   async rateLimitRequest(
@@ -41,7 +90,7 @@ export class RateLimitService {
       return new RateLimitHelper(undefined);
     }
 
-    if (!this.redis) {
+    if (!RateLimitService.redis) {
       logger.warn("Rate limiting not available without Redis");
       return new RateLimitHelper(undefined);
     }
@@ -64,13 +113,22 @@ export class RateLimitService {
       return;
     }
 
+    // Connect Redis if not initialized
+    if (RateLimitService?.redis?.status !== "ready") {
+      try {
+        await RateLimitService?.redis?.connect();
+      } catch (_err) {
+        // Do nothing here. We will fail open if Redis is not available.
+      }
+    }
+
     const rateLimiter = new RateLimiterRedis({
       // Basic options
       points: effectiveConfig.points, // Number of points
       duration: effectiveConfig.durationInSec, // Per second(s)
 
       keyPrefix: this.rateLimitPrefix(resource), // must be unique for limiters with different purpose
-      storeClient: this.redis,
+      storeClient: RateLimitService.redis,
       rejectIfRedisNotReady: true,
     });
 
@@ -100,9 +158,9 @@ export class RateLimitService {
           isFirstInDuration: err.isFirstInDuration,
         };
       } else {
-        // Some other error occurred, rethrow it
+        // Some other error occurred, return undefined to fail open
         logger.error("Internal Rate limit error", err);
-        throw err;
+        return undefined;
       }
     }
 
@@ -118,7 +176,7 @@ export class RateLimitService {
   }
 
   rateLimitPrefix(resource: string) {
-    return `rate-limit:${resource}`;
+    return `${RATE_LIMIT_REDIS_KEY_PREFIX}:${resource}`;
   }
 }
 
@@ -133,33 +191,41 @@ export class RateLimitHelper {
     return this.res ? this.res.remainingPoints < 1 : false;
   }
 
-  sendRestResponseIfLimited(nextResponse: NextApiResponse) {
+  sendRestResponseIfLimited(
+    nextResponse: NextApiResponse,
+    options?: RateLimitResponseOptionsInput,
+  ) {
     if (!this.res || !this.isRateLimited()) {
       logger.error("Trying to send rate limit response without being limited.");
       throw new Error(
         "Trying to send rate limit response without being limited.",
       );
     }
-    return sendRateLimitResponse(nextResponse, this.res);
+    return sendRateLimitResponse(nextResponse, this.res, options);
   }
 }
 
 export const sendRateLimitResponse = (
   res: NextApiResponse,
   rateLimitRes: RateLimitResult,
+  options?: RateLimitResponseOptionsInput,
 ) => {
+  const responseOptions = normalizeRateLimitResponseOptions(options);
   const httpHeader = createHttpHeaderFromRateLimit(rateLimitRes);
 
   for (const [header, value] of Object.entries(httpHeader)) {
     res.setHeader(header, value);
   }
 
-  res.status(429).end("429 - rate limit exceeded");
+  return sendUnstablePublicApiErrorResponse(
+    res,
+    createUnstablePublicApiRateLimitError(rateLimitRes, responseOptions),
+  );
 };
 
-const createHttpHeaderFromRateLimit = (res: RateLimitResult) => {
+export const createHttpHeaderFromRateLimit = (res: RateLimitResult) => {
   return {
-    "Retry-After": res.msBeforeNext / 1000,
+    "Retry-After": Math.ceil(res.msBeforeNext / 1000),
     "X-RateLimit-Limit": res.points,
     "X-RateLimit-Remaining": res.remainingPoints,
     "X-RateLimit-Reset": new Date(Date.now() + res.msBeforeNext).toString(),
@@ -192,18 +258,23 @@ const getPlanBasedRateLimitConfig = (
         durationInSec: null,
       };
     case "cloud:hobby":
-    case "cloud:pro":
       switch (resource) {
         case "ingestion":
           return {
             resource: "ingestion",
-            points: 4000,
+            points: 1000,
+            durationInSec: 60,
+          };
+        case "media-upload":
+          return {
+            resource: "media-upload",
+            points: 1000,
             durationInSec: 60,
           };
         case "legacy-ingestion":
           return {
-            resource: "prompts",
-            points: 400,
+            resource: "legacy-ingestion",
+            points: 100,
             durationInSec: 60,
           };
         case "prompts":
@@ -215,30 +286,196 @@ const getPlanBasedRateLimitConfig = (
         case "public-api":
           return {
             resource: "public-api",
-            points: 1000,
+            points: 30,
+            durationInSec: 60,
+          };
+        case "public-api-legacy":
+          return {
+            resource: "public-api-legacy",
+            points: 15,
+            durationInSec: 60,
+          };
+        case "datasets":
+          return {
+            resource: "datasets",
+            points: 100,
+            durationInSec: 60,
+          };
+        case "annotation-queues":
+          return {
+            resource: "annotation-queues",
+            points: 100,
             durationInSec: 60,
           };
         case "public-api-metrics":
           return {
             resource: "public-api-metrics",
+            points: 100,
+            durationInSec: 86400, // 100 requests per day
+          };
+        case "public-api-v2-metrics":
+          return {
+            resource,
+            points: 100,
+            durationInSec: 86400, // 100 requests per day
+          };
+        case "public-api-daily-metrics-legacy":
+          return {
+            resource: "public-api-daily-metrics-legacy",
             points: 10,
-            durationInSec: 60,
+            durationInSec: 86400, // 10 requests per day
+          };
+        case "trace-delete":
+          return {
+            resource: "trace-delete",
+            points: 50,
+            durationInSec: 86400, // 50 requests per day
+          };
+        case "score-delete":
+          return {
+            resource: "score-delete",
+            points: 50,
+            durationInSec: 86400, // 50 requests per day
+          };
+        case "in-app-agent-run":
+          return {
+            resource: "in-app-agent-run",
+            points: 100,
+            durationInSec: 86400,
+          };
+        case "feedback":
+          return {
+            resource: "feedback",
+            points: 20,
+            durationInSec: 86400, // 20 submissions per day
           };
         default:
-          const exhaustiveCheckDefault: never = resource;
-          throw new Error(`Unhandled resource case: ${exhaustiveCheckDefault}`);
+          const exhaustiveCheck: never = resource;
+          throw new Error(`Unhandled resource case: ${exhaustiveCheck}`);
       }
-    case "cloud:team":
+    case "cloud:core":
+      // TEMPORARY: Expanded selected core plan rate limits to pro limits to enable legacy pro -> core migration
+      // Original core limits (commented out):
+      // ingestion: 4000, public-api: 100, datasets: 200, public-api-metrics: 200, public-api-daily-metrics-legacy: 20
       switch (resource) {
         case "ingestion":
           return {
             resource: "ingestion",
-            points: 20000,
+            // points: 4000, // original core limit
+            points: 20_000, // temporary: using pro limit
+            durationInSec: 60,
+          };
+        case "media-upload":
+          return {
+            resource: "media-upload",
+            points: 4_000,
             durationInSec: 60,
           };
         case "legacy-ingestion":
           return {
+            resource: "legacy-ingestion",
+            points: 400,
+            durationInSec: 60,
+          };
+        case "prompts":
+          return {
             resource: "prompts",
+            points: null,
+            durationInSec: null,
+          };
+        case "public-api":
+          return {
+            resource: "public-api",
+            // points: 100, // original core limit
+            points: 1000, // temporary: using pro limit
+            durationInSec: 60,
+          };
+        case "public-api-legacy":
+          return {
+            resource: "public-api-legacy",
+            points: 30,
+            durationInSec: 60,
+          };
+        case "datasets":
+          return {
+            resource: "datasets",
+            // points: 200, // original core limit
+            points: 1000, // temporary: using pro limit
+            durationInSec: 60,
+          };
+        case "annotation-queues":
+          return {
+            resource: "annotation-queues",
+            points: 1000,
+            durationInSec: 60,
+          };
+        case "public-api-metrics":
+          return {
+            resource: "public-api-metrics",
+            // points: 200, // original core limit
+            points: 2000, // temporary: using pro limit
+            durationInSec: 86400, // 2000 requests per day
+          };
+        case "public-api-v2-metrics":
+          return {
+            resource,
+            points: 100,
+            durationInSec: 3600, // 100 requests per hour
+          };
+        case "public-api-daily-metrics-legacy":
+          return {
+            resource: "public-api-daily-metrics-legacy",
+            // points: 20, // original core limit
+            points: 200, // temporary: using pro limit
+            durationInSec: 86400, // 200 requests per day
+          };
+        case "trace-delete":
+          return {
+            resource: "trace-delete",
+            points: 200,
+            durationInSec: 86400, // 200 requests per day
+          };
+        case "score-delete":
+          return {
+            resource: "score-delete",
+            points: 200,
+            durationInSec: 86400, // 200 requests per day
+          };
+        case "in-app-agent-run":
+          return {
+            resource: "in-app-agent-run",
+            points: 1000,
+            durationInSec: 86400,
+          };
+        case "feedback":
+          return {
+            resource: "feedback",
+            points: 20,
+            durationInSec: 86400, // 20 submissions per day
+          };
+        default:
+          const exhaustiveCheck: never = resource;
+          throw new Error(`Unhandled resource case: ${exhaustiveCheck}`);
+      }
+    case "cloud:pro":
+    case "cloud:team":
+    case "cloud:enterprise":
+      switch (resource) {
+        case "ingestion":
+          return {
+            resource: "ingestion",
+            points: 20_000,
+            durationInSec: 60,
+          };
+        case "media-upload":
+          return {
+            resource: "media-upload",
+            points: 20_000,
+            durationInSec: 60,
+          };
+        case "legacy-ingestion":
+          return {
+            resource: "legacy-ingestion",
             points: 400,
             durationInSec: 60,
           };
@@ -254,15 +491,69 @@ const getPlanBasedRateLimitConfig = (
             points: 1000,
             durationInSec: 60,
           };
+        case "public-api-legacy":
+          return {
+            resource: "public-api-legacy",
+            points: 100,
+            durationInSec: 60,
+          };
+        case "datasets":
+          return {
+            resource: "datasets",
+            points: 1000,
+            durationInSec: 60,
+          };
+        case "annotation-queues":
+          return {
+            resource: "annotation-queues",
+            points: 1000,
+            durationInSec: 60,
+          };
         case "public-api-metrics":
           return {
             resource: "public-api-metrics",
-            points: 10,
-            durationInSec: 60,
+            points: 2000,
+            durationInSec: 86400, // 2000 requests per day
+          };
+        case "public-api-v2-metrics":
+          return {
+            resource,
+            points: 500,
+            durationInSec: 3600, // 500 requests per hour
+          };
+        case "public-api-daily-metrics-legacy":
+          return {
+            resource: "public-api-daily-metrics-legacy",
+            points: 200,
+            durationInSec: 86400, // 200 requests per day
+          };
+        case "trace-delete":
+          return {
+            resource: "trace-delete",
+            points: 1000,
+            durationInSec: 86400, // 1000 requests per day
+          };
+        case "score-delete":
+          return {
+            resource: "score-delete",
+            points: 1000,
+            durationInSec: 86400, // 1000 requests per day
+          };
+        case "in-app-agent-run":
+          return {
+            resource: "in-app-agent-run",
+            points: 1000,
+            durationInSec: 86400,
+          };
+        case "feedback":
+          return {
+            resource: "feedback",
+            points: 20,
+            durationInSec: 86400, // 20 submissions per day
           };
         default:
-          const exhaustiveCheckTeam: never = resource;
-          throw new Error(`Unhandled resource case: ${exhaustiveCheckTeam}`);
+          const exhaustiveCheck: never = resource;
+          throw new Error(`Unhandled resource case: ${exhaustiveCheck}`);
       }
     default:
       const exhaustiveCheck: never = plan;
